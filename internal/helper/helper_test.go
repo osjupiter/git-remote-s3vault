@@ -147,6 +147,55 @@ func (e *testEnv) runSession(t *testing.T, repoDir, input string) string {
 	return out.String()
 }
 
+// runSessionErr is runSession but also returns what the helper wrote to
+// stderr (progress and warnings).
+func (e *testEnv) runSessionErr(t *testing.T, repoDir, input string) (string, string) {
+	t.Helper()
+	t.Chdir(repoDir)
+	var out, errBuf bytes.Buffer
+	h := New(e.cfg, e.store, strings.NewReader(input), &out, &errBuf)
+	if err := h.Run(context.Background()); err != nil {
+		t.Fatalf("helper session failed: %v\nstderr: %s\nstdout: %s", err, errBuf.String(), out.String())
+	}
+	return out.String(), errBuf.String()
+}
+
+func TestProgressOutput(t *testing.T) {
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t)
+
+	// Default verbosity: pushing narrates the slow steps on stderr.
+	_, stderr := e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	for _, want := range []string{"bundling refs/heads/main", "uploading refs/heads/main", "encrypted"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("progress output missing %q:\n%s", want, stderr)
+		}
+	}
+
+	// Fetch narrates download and decryption.
+	sha := git(t, src, "rev-parse", "HEAD")
+	dst := t.TempDir()
+	git(t, dst, "init", "-q", "-b", "main")
+	_, stderr = e.runSessionErr(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha))
+	for _, want := range []string{"downloading refs/heads/main", "decrypting"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("fetch progress missing %q:\n%s", want, stderr)
+		}
+	}
+
+	// `git push -q` (verbosity 0) and --no-progress both silence it.
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "next")
+	_, stderr = e.runSessionErr(t, src, "option verbosity 0\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if strings.Contains(stderr, "bundling") {
+		t.Errorf("verbosity 0 should silence progress:\n%s", stderr)
+	}
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "next2")
+	_, stderr = e.runSessionErr(t, src, "option progress false\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if strings.Contains(stderr, "bundling") {
+		t.Errorf("progress=false should silence progress:\n%s", stderr)
+	}
+}
+
 func TestCapabilities(t *testing.T) {
 	e := newTestEnv(t)
 	out := e.runSession(t, newRepoWithCommit(t), "capabilities\n\n")

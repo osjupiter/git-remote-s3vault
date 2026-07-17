@@ -41,8 +41,9 @@ const (
 var shaRe = regexp.MustCompile(`^[0-9a-f]{40}(?:[0-9a-f]{24})?$`)
 
 type remoteRef struct {
-	sha string
-	key string
+	sha  string
+	key  string
+	size int64
 }
 
 // Helper drives one remote-helper session over stdin/stdout.
@@ -59,6 +60,7 @@ type Helper struct {
 	headRef  string
 	forceAll bool
 	verbose  int
+	progress bool
 
 	repoKey    age.Recipient  // the remote's DEK public key (push side)
 	fetchIDs   []age.Identity // unwrapped DEK + personal identities (fetch side)
@@ -71,12 +73,13 @@ func New(cfg *config.Config, store storage.Storage, in io.Reader, out, errW io.W
 	sc := bufio.NewScanner(in)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	return &Helper{
-		cfg:     cfg,
-		store:   store,
-		in:      sc,
-		out:     bufio.NewWriter(out),
-		errW:    errW,
-		verbose: 1,
+		cfg:      cfg,
+		store:    store,
+		in:       sc,
+		out:      bufio.NewWriter(out),
+		errW:     errW,
+		verbose:  1,
+		progress: true,
 	}
 }
 
@@ -130,6 +133,29 @@ func (h *Helper) warnf(format string, args ...any) {
 	fmt.Fprintf(h.errW, "git-remote-r2: warning: "+format+"\n", args...)
 }
 
+// progressf narrates the slow parts (bundling, encrypting, transferring)
+// on stderr, which git passes through to the user. Silenced by
+// `git push -q` (verbosity 0) and `--no-progress`.
+func (h *Helper) progressf(format string, args ...any) {
+	if !h.progress || h.verbose < 1 {
+		return
+	}
+	fmt.Fprintf(h.errW, "git-remote-r2: "+format+"\n", args...)
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
 func (h *Helper) handleOption(opt string) {
 	name, value, _ := strings.Cut(opt, " ")
 	switch name {
@@ -140,6 +166,7 @@ func (h *Helper) handleOption(opt string) {
 		h.forceAll = value == "true"
 		h.printf("ok\n")
 	case "progress":
+		h.progress = value != "false"
 		h.printf("ok\n")
 	default:
 		h.printf("unsupported\n")
@@ -229,7 +256,7 @@ func (h *Helper) loadRemoteRefs(ctx context.Context) error {
 			h.warnf("ref %s has %d bundles; using the newest (%s). Concurrent pushes may have raced.",
 				refname, len(cands), cands[0].sha[:12])
 		}
-		h.refs[refname] = remoteRef{sha: cands[0].sha, key: cands[0].Key}
+		h.refs[refname] = remoteRef{sha: cands[0].sha, key: cands[0].Key, size: cands[0].Size}
 	}
 
 	// Resolve the remote HEAD (symbolic ref for clone's default branch).
@@ -326,23 +353,24 @@ func (h *Helper) cmdFetchBatch(ctx context.Context, first string) error {
 }
 
 func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
-	key := ""
+	var found *remoteRef
 	if rr, ok := h.refs[name]; ok && rr.sha == sha {
-		key = rr.key
+		found = &rr
 	} else {
 		// The exact sha may live under another ref, or the listing may be
 		// stale; search all known bundles for it.
 		for _, rr := range h.refs {
 			if rr.sha == sha {
-				key = rr.key
+				found = &rr
 				break
 			}
 		}
 	}
-	if key == "" {
+	if found == nil {
 		return fmt.Errorf("no bundle found for %s", sha)
 	}
-	h.logf("downloading %s", key)
+	key := found.key
+	h.progressf("downloading %s (%s)", name, humanSize(found.size))
 
 	body, err := h.store.Get(ctx, key)
 	if err != nil {
@@ -356,6 +384,7 @@ func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
 		if err != nil {
 			return err
 		}
+		h.progressf("decrypting and unbundling %s", name)
 		payload, err = cryptox.Decrypt(body, ids)
 		if err != nil {
 			return fmt.Errorf("decrypting bundle: %w (is your key granted access? see `git-remote-r2 key list`)", err)
@@ -468,6 +497,7 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 	}
 
 	// 1. Bundle the full history of the pushed commit.
+	h.progressf("bundling %s (full history)", dst)
 	tmp, err := gitutil.TempFile("git-remote-r2-push-*.bundle")
 	if err != nil {
 		return err
@@ -520,7 +550,12 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 		return err
 	}
 	newKey := h.key(dst, localSHA+h.ext())
-	h.logf("uploading %s (%d bytes)", newKey, st.Size())
+	if h.cfg.Encryption == config.EncryptionAge {
+		h.progressf("uploading %s (%s, encrypted)", dst, humanSize(st.Size()))
+	} else {
+		h.progressf("uploading %s (%s, PLAINTEXT)", dst, humanSize(st.Size()))
+	}
+	h.logf("object key: %s", newKey)
 	if err := h.store.Put(ctx, newKey, f, st.Size()); err != nil {
 		return err
 	}
