@@ -3,11 +3,18 @@ package setupcmd
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"filippo.io/age"
+	"golang.org/x/crypto/ssh"
 )
 
 func gitOut(t *testing.T, args ...string) (string, error) {
@@ -20,8 +27,10 @@ func setupRepo(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
 	t.Chdir(dir)
-	// Isolate the default identity location and global git config.
+	// Isolate the default identity location, the ~/.ssh scan, and global
+	// git config from the developer's real machine.
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".xdg"))
+	t.Setenv("HOME", filepath.Join(dir, ".home"))
 	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
 	if out, err := gitOut(t, "init", "-q", "-b", "main"); err != nil {
 		t.Fatalf("git init: %v %s", err, out)
@@ -204,6 +213,119 @@ func TestWizardStripsPasteArtifacts(t *testing.T) {
 	}
 	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://my-bucket/my-prefix" {
 		t.Errorf("paste artifacts leaked into the config: url=%q", url)
+	}
+}
+
+// seedMachineKeys writes an identity file with two age keys and returns
+// both recipients.
+func seedMachineKeys(t *testing.T) []string {
+	t.Helper()
+	var recips []string
+	var content strings.Builder
+	for range 2 {
+		id, err := age.GenerateX25519Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		recips = append(recips, id.Recipient().String())
+		fmt.Fprintf(&content, "%s\n", id)
+	}
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-r2")
+	os.MkdirAll(dir, 0o700)
+	if err := os.WriteFile(filepath.Join(dir, "identity.txt"), []byte(content.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return recips
+}
+
+// writeSSHKey creates an OpenSSH keypair under $HOME/.ssh and returns the
+// private key path and the public key line.
+func writeSSHKey(t *testing.T, name, passphrase string) (string, string) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var block *pem.Block
+	if passphrase == "" {
+		block, err = ssh.MarshalPrivateKey(priv, "test key")
+	} else {
+		block, err = ssh.MarshalPrivateKeyWithPassphrase(priv, "test key", []byte(passphrase))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshDir := filepath.Join(os.Getenv("HOME"), ".ssh")
+	os.MkdirAll(sshDir, 0o700)
+	privPath := filepath.Join(sshDir, name)
+	if err := os.WriteFile(privPath, pem.EncodeToMemory(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sshPub, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(sshPub))) + " test key"
+	if err := os.WriteFile(privPath+".pub", []byte(pubLine+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return privPath, pubLine
+}
+
+func TestWizardKeySelectionPicksSpecificAgeKey(t *testing.T) {
+	setupRepo(t)
+	recips := seedMachineKeys(t)
+
+	// Candidates: 1,2 = age keys, 3 = generate. Pick the second age key.
+	out, err := runWithInput(t,
+		"1\nacct\nbkt\npfx\n\n2\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard failed: %v\n%s", err, out)
+	}
+	got, _ := gitOut(t, "config", "--get-all", "remote.origin.agerecipients")
+	if got != recips[1] {
+		t.Errorf("recipients = %q, want exactly the chosen key %q", got, recips[1])
+	}
+}
+
+func TestWizardKeySelectionSSH(t *testing.T) {
+	setupRepo(t)
+	seedMachineKeys(t)
+	privPath, pubLine := writeSSHKey(t, "id_ed25519", "")
+
+	// Candidates: 1,2 age; 3 SSH; 4 generate. Pick the SSH key.
+	out, err := runWithInput(t,
+		"1\nacct\nbkt\npfx\n\n3\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard failed: %v\n%s", err, out)
+	}
+	if got, _ := gitOut(t, "config", "--get-all", "remote.origin.agerecipients"); got != pubLine {
+		t.Errorf("recipients = %q, want the SSH public key", got)
+	}
+	if got, _ := gitOut(t, "config", "remote.origin.ageidentityfile"); got != privPath {
+		t.Errorf("ageidentityfile = %q, want %q", got, privPath)
+	}
+}
+
+func TestWizardSkipsPassphraseProtectedSSHKeys(t *testing.T) {
+	setupRepo(t)
+	seedMachineKeys(t)
+	writeSSHKey(t, "id_locked", "s3kret-passphrase")
+
+	// Locked key is not offered: candidates are 2 age keys + generate.
+	out, err := runWithInput(t,
+		"1\nacct\nbkt\npfx\n\n1\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "passphrase-protected") {
+		t.Errorf("expected a note about the skipped key:\n%s", out)
+	}
+	if strings.Contains(out, "id_locked") {
+		t.Errorf("locked key must not be offered:\n%s", out)
 	}
 }
 

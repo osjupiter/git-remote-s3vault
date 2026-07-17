@@ -128,6 +128,32 @@ func DefaultIdentityPath() (string, error) {
 	return filepath.Join(dir, "git-remote-r2", "identity.txt"), nil
 }
 
+// AppendNewIdentity generates a fresh X25519 identity and appends it to
+// the identity file at path (creating the file if needed). Existing
+// identities in the file remain valid.
+func AppendNewIdentity(path string) (*age.X25519Identity, error) {
+	id, err := age.GenerateX25519Identity()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	_, werr := fmt.Fprintf(f, "# created: %s\n# public key: %s\n%s\n",
+		time.Now().Format(time.RFC3339), id.Recipient(), id)
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		return nil, werr
+	}
+	return id, nil
+}
+
 // EnsureIdentityFile loads the identity file at path (the default location
 // when path is empty), generating a fresh X25519 identity if the file does
 // not exist. It returns the resolved path, whether it was created, and the

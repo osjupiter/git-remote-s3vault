@@ -53,9 +53,19 @@ Cloudflare account ID: abc123
 Bucket name: my-bucket
 Prefix inside the bucket [my-repo]:
 Remote name [origin]:
-→ r2://my-bucket/my-repo
+Which key should be able to decrypt this repository?
+  1) age key age1ql3z7hjy54pw3hyw… (~/.config/git-remote-r2/identity.txt)
+  2) SSH key ssh-ed25519 you@laptop (~/.ssh/id_ed25519)
+  3) Generate a new age key
+Key [1]:
+Create remote "origin" → r2://my-bucket/my-repo? [Y]:
 ...
 ```
+
+The key list offers every age key in your machine-key file and any
+decryption-capable SSH key under `~/.ssh` (passphrase-protected SSH keys
+are not supported and are skipped). With no existing keys, a fresh age
+key is generated without asking.
 
 Passing the URL directly skips the wizard (handy for scripts):
 

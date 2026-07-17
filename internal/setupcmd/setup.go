@@ -68,13 +68,15 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	}
 
 	rawURL := fs.Arg(0)
+	var wizKey *keyCandidate
 	if rawURL == "" {
-		answers, err := runWizard(stdin, stdout, *remote)
+		answers, err := runWizard(stdin, stdout, *remote, *encryption)
 		if err != nil {
 			return err
 		}
 		rawURL = answers.rawURL
 		*remote = answers.remoteName
+		wizKey = answers.key
 		if answers.accountID != "" {
 			*accountID = answers.accountID
 		}
@@ -90,22 +92,38 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	var ownRecipients []string
 	var idPath string
 	if *encryption == string(config.EncryptionAge) {
-		var created bool
-		var recips []string
-		var err error
-		idPath, created, recips, err = cryptox.EnsureIdentityFile(*identityPath)
-		if err != nil {
-			return err
-		}
-		ownRecipients = recips
-		if created {
-			fmt.Fprintf(stdout, "✓ generated this machine's key (age identity): %s\n", idPath)
+		if wizKey != nil {
+			// The wizard already picked (or generated) exactly one key.
+			ownRecipients = []string{wizKey.recipient}
+			if wizKey.identityPath != "" {
+				idPath = wizKey.identityPath
+				if err := runGit(nil, "config", "remote."+*remote+".ageidentityfile", idPath); err != nil {
+					return err
+				}
+			} else {
+				var err error
+				if idPath, err = cryptox.DefaultIdentityPath(); err != nil {
+					return err
+				}
+			}
 		} else {
-			fmt.Fprintf(stdout, "✓ using this machine's existing key: %s\n", idPath)
-		}
-		if *identityPath != "" {
-			if err := runGit(nil, "config", "remote."+*remote+".ageidentityfile", idPath); err != nil {
+			var created bool
+			var recips []string
+			var err error
+			idPath, created, recips, err = cryptox.EnsureIdentityFile(*identityPath)
+			if err != nil {
 				return err
+			}
+			ownRecipients = recips
+			if created {
+				fmt.Fprintf(stdout, "✓ generated this machine's key (age identity): %s\n", idPath)
+			} else {
+				fmt.Fprintf(stdout, "✓ using this machine's existing key: %s\n", idPath)
+			}
+			if *identityPath != "" {
+				if err := runGit(nil, "config", "remote."+*remote+".ageidentityfile", idPath); err != nil {
+					return err
+				}
 			}
 		}
 		if len(ownRecipients) == 0 && len(extraRecipients) == 0 {
@@ -214,11 +232,13 @@ type wizardAnswers struct {
 	remoteName string
 	accountID  string
 	endpoint   string
+	key        *keyCandidate
 }
 
-// runWizard interactively assembles the remote URL and backend settings.
-// Every question has a sensible default so Enter-Enter-Enter works.
-func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote string) (*wizardAnswers, error) {
+// runWizard interactively assembles the remote URL, backend settings, and
+// key choice. Every question has a sensible default so Enter-Enter-Enter
+// works.
+func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption string) (*wizardAnswers, error) {
 	in := bufio.NewReader(stdin)
 	ask := func(label, def string) (string, error) {
 		if def != "" {
@@ -249,6 +269,11 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote string) (*wizard
 			if s := strings.ToLower(use); s == "y" || s == "yes" {
 				a.rawURL = existing
 				a.remoteName = defaultRemote
+				if encryption == string(config.EncryptionAge) {
+					if a.key, err = pickKey(ask, stdout); err != nil {
+						return nil, err
+					}
+				}
 				return a, nil
 			}
 		}
@@ -306,6 +331,12 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote string) (*wizard
 	}
 	if a.remoteName, err = ask("Remote name", defaultRemote); err != nil {
 		return nil, err
+	}
+
+	if encryption == string(config.EncryptionAge) {
+		if a.key, err = pickKey(ask, stdout); err != nil {
+			return nil, err
+		}
 	}
 
 	a.rawURL = "r2://" + bucket
