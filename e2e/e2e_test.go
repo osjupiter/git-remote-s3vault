@@ -549,7 +549,7 @@ func TestGrantTeamFlow(t *testing.T) {
 
 // TestSavedCredentialsFlow proves that credentials stored in
 // ~/.config/git-remote-r2/credentials are enough on their own: with no
-// AWS_* / R2_* variables in the environment, setup reports the saved
+// AWS_* variables in the environment, setup reports the saved
 // entry and git push / clone authenticate through it.
 func TestSavedCredentialsFlow(t *testing.T) {
 	h := newHarness(t)
@@ -570,7 +570,6 @@ func TestSavedCredentialsFlow(t *testing.T) {
 	// Strip every credential variable; only the store remains.
 	env := []string{
 		"AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=",
-		"R2_ACCESS_KEY_ID=", "R2_SECRET_ACCESS_KEY=",
 		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + cfgHome,
 	}

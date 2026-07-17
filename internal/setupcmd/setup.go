@@ -188,7 +188,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			fmt.Fprintf(stdout, "✗ connectivity check failed: %v\n", err)
 			fmt.Fprintf(stdout, "  (re-run setup to enter credentials interactively, set AWS_ACCESS_KEY_ID/\n")
-			fmt.Fprintf(stdout, "   AWS_SECRET_ACCESS_KEY or R2_* env vars, or skip this check with --no-verify)\n")
+			fmt.Fprintf(stdout, "   AWS_SECRET_ACCESS_KEY env vars, or skip this check with --no-verify)\n")
 			return fmt.Errorf("setup incomplete: bucket not reachable")
 		}
 		if *encryption == string(config.EncryptionAge) {
@@ -328,7 +328,7 @@ func firstNonEmptyEnv(names ...string) string {
 // reportSavedCredentials tells the user when credentials came from the
 // on-disk store rather than the environment.
 func reportSavedCredentials(cfg *config.Config, stdout io.Writer) {
-	envHasCreds := os.Getenv("R2_ACCESS_KEY_ID") != "" || os.Getenv("AWS_ACCESS_KEY_ID") != ""
+	envHasCreds := os.Getenv("AWS_ACCESS_KEY_ID") != ""
 	if envHasCreds || cfg.AccessKeyID == "" {
 		return
 	}
@@ -343,7 +343,7 @@ func reportSavedCredentials(cfg *config.Config, stdout io.Writer) {
 func promptCredentials(cfg *config.Config, stdout io.Writer) bool {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		fmt.Fprintf(stdout, "• no S3 credentials found; set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or R2_*)\n")
+		fmt.Fprintf(stdout, "• no S3 credentials found; set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY\n")
 		return false
 	}
 	defer tty.Close()

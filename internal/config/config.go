@@ -144,8 +144,10 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 	c.Endpoint = lookup("endpoint", "GIT_REMOTE_R2_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
 	c.Region = lookup("region", "GIT_REMOTE_R2_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")
 
-	c.AccessKeyID = firstNonEmpty(getenv("R2_ACCESS_KEY_ID"), getenv("AWS_ACCESS_KEY_ID"))
-	c.SecretAccessKey = firstNonEmpty(getenv("R2_SECRET_ACCESS_KEY"), getenv("AWS_SECRET_ACCESS_KEY"))
+	// R2's S3-compatibility API takes AWS-shaped credentials, so the
+	// standard variable names are the only ones — no R2_* aliases.
+	c.AccessKeyID = getenv("AWS_ACCESS_KEY_ID")
+	c.SecretAccessKey = getenv("AWS_SECRET_ACCESS_KEY")
 	c.SessionToken = getenv("AWS_SESSION_TOKEN")
 
 	if c.Endpoint == "" && c.AccountID != "" {

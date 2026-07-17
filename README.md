@@ -189,7 +189,7 @@ Two sources, checked in order — nothing else is ever consulted (no
 `~/.aws/credentials`, no shared config, no instance roles):
 
 1. environment — `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
-   (`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are accepted as aliases)
+   — the same AWS-shaped key pair for R2 and any other backend
 2. `~/.config/git-remote-r2/credentials` — written by `setup`, strictly
    one entry per bucket (`[account:<id> bucket:<name>]`), no fallback
 
