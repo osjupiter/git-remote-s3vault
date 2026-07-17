@@ -125,6 +125,44 @@ $ git-remote-r2 key grant age1<their-public-key>
 ✓ access granted (no re-encryption needed — existing history is immediately readable)
 ```
 
+## Cloning
+
+On a machine that already has access (a granted machine key + saved
+credentials), cloning is just git:
+
+```console
+$ git clone r2://my-bucket/my-repo
+```
+
+For a machine that has nothing yet, `git-remote-r2 clone` prepares
+everything first — machine key, credentials, access check — and tells you
+exactly what's missing instead of failing with a cryptic decryption error:
+
+```console
+$ git-remote-r2 clone r2://my-bucket/my-repo
+✓ generated this machine's key (age identity): ~/.config/git-remote-r2/identity.txt
+✗ this machine's key has no access to the repository yet.
+
+  Your public key:
+    age1nEw...
+
+  Ask a member to run:
+    git-remote-r2 key grant age1nEw... r2://my-bucket/my-repo
+
+  Or, if you hold the recovery key:
+    git-remote-r2 key recover r2://my-bucket/my-repo
+
+# ...after a member runs the grant (or you run `key recover`):
+$ git-remote-r2 clone r2://my-bucket/my-repo
+✓ access confirmed
+Cloning into 'my-repo'...
+```
+
+Credentials are prompted for (and remembered) when needed, and the
+backend settings are written into the fresh clone's repo config, so from
+then on every git command just works. `--account-id` / `--endpoint` /
+`--identity` flags are available as with `setup`.
+
 ### Recovery key & disaster recovery
 
 When setup initializes a repository it also mints a **recovery key** and

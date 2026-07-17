@@ -44,9 +44,16 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "clone" && os.Getenv("GIT_DIR") == "" {
+		if err := setupcmd.RunClone(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fatal(err)
+		}
+		return
+	}
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: git-remote-r2 <remote-name> <url>")
-		fmt.Fprintln(os.Stderr, "       git-remote-r2 setup <r2://bucket/prefix> [flags]")
+		fmt.Fprintln(os.Stderr, "       git-remote-r2 setup [r2://bucket/prefix] [flags]")
+		fmt.Fprintln(os.Stderr, "       git-remote-r2 clone <r2://bucket/prefix> [dir] [flags]")
 		fmt.Fprintln(os.Stderr, "       git-remote-r2 key grant|list|revoke|recovery-init|recover [args] [flags]")
 		fmt.Fprintln(os.Stderr, "(without \"setup\", this program is a git remote helper run by git, not directly)")
 		os.Exit(129)

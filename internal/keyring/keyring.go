@@ -227,6 +227,27 @@ func (k *Keyring) Unwrap(ctx context.Context, ids []age.Identity) (*age.X25519Id
 	return nil, false, nil
 }
 
+// Access resolves the DEK for the given identities: by unwrapping a slot,
+// or by noticing that one of the identities IS the DEK (post-recovery).
+func (k *Keyring) Access(ctx context.Context, ids []age.Identity) (*age.X25519Identity, bool, error) {
+	dek, ok, err := k.Unwrap(ctx, ids)
+	if err != nil || ok {
+		return dek, ok, err
+	}
+	r, exists, err := k.RepoRecipient(ctx)
+	if err != nil || !exists {
+		return nil, false, err
+	}
+	if xr, okR := r.(*age.X25519Recipient); okR {
+		for _, id := range ids {
+			if x, okX := id.(*age.X25519Identity); okX && x.Recipient().String() == xr.String() {
+				return x, true, nil
+			}
+		}
+	}
+	return nil, false, nil
+}
+
 // Revoke deletes a slot by label or by recipient public key. Returns the
 // removed slot. NOTE: true revocation also requires rotating the DEK.
 func (k *Keyring) Revoke(ctx context.Context, labelOrRecipient string) (*Slot, error) {

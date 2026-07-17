@@ -376,6 +376,37 @@ func TestWizardAbortsOnClosedInput(t *testing.T) {
 	}
 }
 
+func TestCloneRejectsBadInput(t *testing.T) {
+	setupRepo(t) // isolates env; clone itself runs anywhere
+	runClone := func(args ...string) error {
+		var out bytes.Buffer
+		return RunClone(context.Background(), args, &out, &out)
+	}
+	if err := runClone(); err == nil {
+		t.Error("clone without a URL must fail")
+	}
+	if err := runClone("https://github.com/x/y.git"); err == nil {
+		t.Error("clone with a non-r2 URL must fail")
+	}
+	if err := runClone("r2://b/p", "dir", "extra"); err == nil {
+		t.Error("clone with too many args must fail")
+	}
+}
+
+func TestDeriveCloneDir(t *testing.T) {
+	cases := map[string]string{
+		"r2://bucket/team/project": "project",
+		"r2://bucket/repo.git":     "repo",
+		"r2://bucket":              "bucket",
+		"r2://bucket/":             "bucket",
+	}
+	for url, want := range cases {
+		if got := deriveCloneDir(url); got != want {
+			t.Errorf("deriveCloneDir(%q) = %q, want %q", url, got, want)
+		}
+	}
+}
+
 func TestSetupRejectsBadInput(t *testing.T) {
 	setupRepo(t)
 	if _, err := run(t, "--no-verify", "https://github.com/x/y.git"); err == nil {

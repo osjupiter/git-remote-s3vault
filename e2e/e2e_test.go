@@ -710,6 +710,84 @@ func TestDedupAcrossPushesAndTags(t *testing.T) {
 	t.Logf("sizes: base=%d afterTag=+%d afterCommit=+%d", base, afterTag-base, afterCommit-afterTag)
 }
 
+// TestCloneCommandFlow: onboarding machine #2 with `git-remote-r2 clone`.
+// First run has no access — it prints the machine's public key and the
+// exact grant command; after a member grants it, the re-run clones.
+func TestCloneCommandFlow(t *testing.T) {
+	h := newHarness(t)
+	remoteURL := "r2://" + bucket + "/clone-cmd"
+
+	bin := filepath.Join(h.binDir, "git-remote-r2")
+	runBin := func(dir string, env []string, args ...string) (string, error) {
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = dir
+		cmd.Env = append(append([]string{}, h.baseEnv...), env...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// Alice publishes the repository.
+	aliceEnv := []string{
+		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+	}
+	repo := t.TempDir()
+	h.mustGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "hello.txt"), []byte("clone me\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "c")
+	if out, err := runBin(repo, aliceEnv, "setup", remoteURL); err != nil {
+		t.Fatalf("alice setup: %v\n%s", err, out)
+	}
+	if out, err := h.git(t, repo, aliceEnv, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("alice push: %v\n%s", err, out)
+	}
+
+	// Bob's fresh machine: `clone` refuses with actionable instructions.
+	bobEnv := []string{
+		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+	}
+	work := t.TempDir()
+	out, err := runBin(work, bobEnv, "clone", remoteURL, "myclone")
+	if err == nil {
+		t.Fatalf("clone before grant must fail:\n%s", out)
+	}
+	if !strings.Contains(out, "key grant age1") {
+		t.Fatalf("expected the exact grant command in output:\n%s", out)
+	}
+	bobPub := regexp.MustCompile(`age1[a-z0-9]+`).FindString(out)
+	if bobPub == "" {
+		t.Fatalf("no public key in output:\n%s", out)
+	}
+
+	// Alice grants; bob re-runs the same command and gets a working clone.
+	if out, err := runBin(repo, aliceEnv, "key", "grant", bobPub); err != nil {
+		t.Fatalf("grant: %v\n%s", err, out)
+	}
+	out, err = runBin(work, bobEnv, "clone", remoteURL, "myclone")
+	if err != nil {
+		t.Fatalf("clone after grant: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "access confirmed") {
+		t.Errorf("missing access confirmation:\n%s", out)
+	}
+	data, err := os.ReadFile(filepath.Join(work, "myclone", "hello.txt"))
+	if err != nil || string(data) != "clone me\n" {
+		t.Fatalf("cloned content: %q, %v", data, err)
+	}
+
+	// Backend settings were persisted into the fresh repository.
+	cmd := exec.Command("git", "config", "remote.origin.endpoint")
+	cmd.Dir = filepath.Join(work, "myclone")
+	cmd.Env = append(append([]string{}, h.baseEnv...), bobEnv...)
+	if ep, err := cmd.Output(); err != nil || strings.TrimSpace(string(ep)) != h.endpoint {
+		t.Errorf("endpoint not persisted in clone: %q, %v", ep, err)
+	}
+}
+
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
