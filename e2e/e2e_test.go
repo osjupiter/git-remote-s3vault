@@ -631,7 +631,7 @@ func TestInteractiveWizardFlow(t *testing.T) {
 	setup := exec.Command(filepath.Join(h.binDir, "git-remote-r2"), "setup")
 	setup.Dir = repo
 	setup.Env = append(append([]string{}, h.baseEnv...), env...)
-	setup.Stdin = strings.NewReader("\n\n" + bucket + "\nwizard-repo\n\n")
+	setup.Stdin = strings.NewReader("\n\n" + bucket + "\nwizard-repo\n\n\n")
 	out, err := setup.CombinedOutput()
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)

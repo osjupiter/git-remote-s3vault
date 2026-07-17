@@ -131,7 +131,7 @@ func TestWizardBuildsURLFromAnswers(t *testing.T) {
 	// Backend 1 (R2), account, bucket, default prefix (repo dir name),
 	// default remote name.
 	out, err := runWithInput(t,
-		"1\nacct42\nmy-bucket\nmy-prefix\n\n",
+		"1\nacct42\nmy-bucket\nmy-prefix\n\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
@@ -150,7 +150,7 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 	// Enter accepts backend=2 (env-derived) and the endpoint default; the
 	// prefix default is the repository directory name.
 	out, err := runWithInput(t,
-		"\n\nbkt\n\nupstream\n",
+		"\n\nbkt\n\nupstream\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
@@ -174,6 +174,36 @@ func TestWizardReusesExistingRemote(t *testing.T) {
 	}
 	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://old-bucket/old-prefix" {
 		t.Errorf("remote url = %q", url)
+	}
+}
+
+func TestWizardConfirmationAbortsCleanly(t *testing.T) {
+	setupRepo(t)
+	out, err := runWithInput(t,
+		"1\nacct42\nmy-bucket\nmy-prefix\n\nn\n", // "n" at the final confirmation
+		"--no-verify")
+	if err == nil {
+		t.Fatalf("declined confirmation must abort:\n%s", out)
+	}
+	if _, err := gitOut(t, "remote", "get-url", "origin"); err == nil {
+		t.Fatal("no remote should have been created after aborting")
+	}
+}
+
+func TestWizardStripsPasteArtifacts(t *testing.T) {
+	setupRepo(t)
+	// A bracketed-paste accident: markers and control characters around
+	// the bucket answer, and a stray "]" paste remnant as the remote name
+	// would have been — here the sanitized empty-ish answer falls back to
+	// the default instead.
+	out, err := runWithInput(t,
+		"1\nacct42\n\x1b[200~my-bucket\x1b[201~\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard failed: %v\n%s", err, out)
+	}
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://my-bucket/my-prefix" {
+		t.Errorf("paste artifacts leaked into the config: url=%q", url)
 	}
 }
 

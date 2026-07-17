@@ -230,7 +230,7 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote string) (*wizard
 		if err != nil && line == "" {
 			return "", fmt.Errorf("setup aborted (input closed)")
 		}
-		if v := strings.TrimSpace(line); v != "" {
+		if v := sanitizeAnswer(line); v != "" {
 			return v, nil
 		}
 		return def, nil
@@ -312,8 +312,34 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote string) (*wizard
 	if p := strings.Trim(prefix, "/"); p != "" {
 		a.rawURL += "/" + p
 	}
-	fmt.Fprintf(stdout, "→ %s\n\n", a.rawURL)
+
+	// Final confirmation catches paste accidents (a remote named "]", a
+	// bucket with a stray newline, ...) before anything is written.
+	confirm, err := ask(fmt.Sprintf("Create remote %q → %s?", a.remoteName, a.rawURL), "Y")
+	if err != nil {
+		return nil, err
+	}
+	if s := strings.ToLower(confirm); s != "y" && s != "yes" {
+		return nil, fmt.Errorf("setup aborted; nothing was changed")
+	}
+	fmt.Fprintf(stdout, "\n")
 	return a, nil
+}
+
+// sanitizeAnswer strips bracketed-paste markers and control characters
+// that terminals inject into pasted text; without this a paste accident
+// can silently produce a remote named "]" or a bucket with an ESC in it.
+func sanitizeAnswer(line string) string {
+	for _, marker := range []string{"\x1b[200~", "\x1b[201~"} {
+		line = strings.ReplaceAll(line, marker, "")
+	}
+	line = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, line)
+	return strings.TrimSpace(line)
 }
 
 func firstNonEmptyEnv(names ...string) string {
