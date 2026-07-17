@@ -109,6 +109,9 @@ type testEnv struct {
 
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
+	// Isolate from the developer's real machine key and recipients file:
+	// the helper's default-path fallbacks resolve via os.UserConfigDir.
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		t.Fatal(err)
