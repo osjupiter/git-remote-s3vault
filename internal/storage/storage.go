@@ -42,14 +42,21 @@ type S3Storage struct {
 }
 
 // New builds an S3Storage from the resolved helper configuration.
+// Credentials must be explicit (env vars or the credential store); the
+// AWS default chain — ~/.aws/credentials, instance roles — is
+// deliberately never consulted.
 func New(ctx context.Context, cfg *config.Config) (*S3Storage, error) {
-	var loadOpts []func(*awsconfig.LoadOptions) error
-	loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
-	if cfg.AccessKeyID != "" && cfg.SecretAccessKey != "" {
-		loadOpts = append(loadOpts, awsconfig.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken)))
+	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
+		return nil, fmt.Errorf("no S3 credentials configured for bucket %q; "+
+			"run `git-remote-r2 setup`, or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or R2_*)", cfg.Bucket)
 	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken)),
+		awsconfig.WithSharedConfigFiles(nil),
+		awsconfig.WithSharedCredentialsFiles(nil),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}

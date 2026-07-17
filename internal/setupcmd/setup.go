@@ -208,16 +208,16 @@ func reportSavedCredentials(cfg *config.Config, stdout io.Writer) {
 func promptCredentials(cfg *config.Config, stdout io.Writer) bool {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		fmt.Fprintf(stdout, "• no stored S3 credentials; relying on the AWS default chain\n")
+		fmt.Fprintf(stdout, "• no S3 credentials found; set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or R2_*)\n")
 		return false
 	}
 	defer tty.Close()
 
 	credPath, _ := credstore.Path()
-	fmt.Fprintf(tty, "\nNo S3 credentials found (checked the environment and %s).\n", credPath)
+	fmt.Fprintf(tty, "\nNo S3 credentials found for bucket %q (checked the environment and %s).\n", cfg.Bucket, credPath)
 	fmt.Fprintf(tty, "Tip: create an R2 API token scoped to ONLY this bucket (Object Read & Write),\n")
 	fmt.Fprintf(tty, "     so that a leaked key cannot touch anything else.\n\n")
-	fmt.Fprintf(tty, "Access Key ID (leave empty to skip and use the AWS default chain): ")
+	fmt.Fprintf(tty, "Access Key ID (leave empty to skip): ")
 
 	line, err := bufio.NewReader(tty).ReadString('\n')
 	if err != nil {
@@ -239,27 +239,13 @@ func promptCredentials(cfg *config.Config, stdout io.Writer) bool {
 		return false
 	}
 
-	// Bucket-scoped tokens are the recommended setup, so bucket-scoped
-	// storage is the default; account-wide is one keystroke away.
-	bucket := cfg.Bucket
-	fmt.Fprintf(tty, "Scope: [B] this bucket only (%s, recommended) / [a] whole account: ", cfg.Bucket)
-	scopeLine, err := bufio.NewReader(tty).ReadString('\n')
-	if err != nil {
-		return false
-	}
-	scopeNote := "for bucket " + cfg.Bucket
-	if s := strings.ToLower(strings.TrimSpace(scopeLine)); s == "a" || s == "account" {
-		bucket = ""
-		scopeNote = "shared by every repo on this account"
-	}
-
-	path, section, err := credstore.Save(cfg.AccountID, cfg.Endpoint, bucket,
+	path, section, err := credstore.Save(cfg.AccountID, cfg.Endpoint, cfg.Bucket,
 		credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret})
 	if err != nil {
 		fmt.Fprintf(tty, "✗ could not save credentials: %v\n", err)
 		return false
 	}
-	fmt.Fprintf(stdout, "✓ credentials saved to %s [%s] — %s\n", path, section, scopeNote)
+	fmt.Fprintf(stdout, "✓ credentials saved to %s [%s]\n", path, section)
 	return true
 }
 

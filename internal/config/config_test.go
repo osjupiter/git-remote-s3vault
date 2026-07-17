@@ -147,7 +147,8 @@ func TestSavedCredentialsResolution(t *testing.T) {
 		t.Errorf("env should win over the store, got %q", c.AccessKeyID)
 	}
 
-	// No match in the store → left empty for the AWS default chain.
+	// No match in the store → left empty (storage.New then rejects the
+	// connection with guidance; there is no AWS-chain fallback).
 	c, err = load("origin", "r2://b", fakeGit{}, env(map[string]string{
 		"R2_ACCOUNT_ID": "unknown-acct",
 	}), stored)

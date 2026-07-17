@@ -561,8 +561,8 @@ func TestSavedCredentialsFlow(t *testing.T) {
 	if err := os.MkdirAll(credDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	credFile := fmt.Sprintf("[endpoint:%s]\naccess_key_id = %s\nsecret_access_key = %s\n",
-		h.endpoint, h.username, h.password)
+	credFile := fmt.Sprintf("[endpoint:%s bucket:%s]\naccess_key_id = %s\nsecret_access_key = %s\n",
+		h.endpoint, bucket, h.username, h.password)
 	if err := os.WriteFile(filepath.Join(credDir, "credentials"), []byte(credFile), 0o600); err != nil {
 		t.Fatal(err)
 	}

@@ -2,21 +2,17 @@
 // ~/.config/git-remote-r2/credentials.
 //
 // The file is plaintext with 0600 permissions — the same trust model as
-// standard credential files. Because the recommended setup is one
-// bucket-scoped API token per repository, entries are keyed by bucket
-// first, with account- or endpoint-wide entries as fallback:
+// standard credential files. The expected setup is one bucket-scoped API
+// token per repository, so every entry is keyed by its bucket (qualified
+// by account or endpoint to disambiguate identical bucket names across
+// backends). There are no account-wide entries and no fallback:
 //
-//	[account:abc123 bucket:my-repo]      # bucket-scoped token (recommended)
+//	[account:abc123 bucket:my-repo]
 //	access_key_id = ...
 //	secret_access_key = ...
 //
-//	[account:abc123]                     # account-wide fallback
+//	[endpoint:http://127.0.0.1:9000 bucket:test]   # generic S3 backends
 //	...
-//
-//	[endpoint:http://127.0.0.1:9000]     # generic S3 backends
-//	...
-//
-// Lookup order: account+bucket, endpoint+bucket, account, endpoint.
 package credstore
 
 import (
@@ -41,33 +37,29 @@ func Path() (string, error) {
 	return filepath.Join(dir, "git-remote-r2", "credentials"), nil
 }
 
-// SectionKey derives the storage key. bucket == "" means an account- or
-// endpoint-wide entry; with a bucket the entry applies to that bucket only
-// (matching the recommended one-token-per-bucket setup).
+// SectionKey derives the storage key for a bucket, qualified by account
+// or endpoint when one is configured.
 func SectionKey(accountID, endpoint, bucket string) (string, error) {
-	var base string
-	switch {
-	case accountID != "":
-		base = "account:" + accountID
-	case endpoint != "":
-		base = "endpoint:" + strings.TrimRight(endpoint, "/")
+	if bucket == "" {
+		return "", fmt.Errorf("a bucket is required (entries are always bucket-scoped)")
 	}
 	switch {
-	case base != "" && bucket != "":
-		return base + " bucket:" + bucket, nil
-	case base != "":
-		return base, nil
-	case bucket != "":
-		return "bucket:" + bucket, nil
+	case accountID != "":
+		return "account:" + accountID + " bucket:" + bucket, nil
+	case endpoint != "":
+		return "endpoint:" + strings.TrimRight(endpoint, "/") + " bucket:" + bucket, nil
 	default:
-		return "", fmt.Errorf("neither an account ID, an endpoint, nor a bucket is configured")
+		return "bucket:" + bucket, nil
 	}
 }
 
-// Lookup finds stored credentials, most specific entry first:
-// account+bucket, endpoint+bucket, account, endpoint. A missing or
-// unreadable file is treated as "no credentials".
+// Lookup finds the stored credentials for exactly this bucket. There is
+// no fallback; a missing or unreadable file is treated as "no
+// credentials".
 func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
+	if bucket == "" {
+		return Credentials{}, false
+	}
 	path, err := Path()
 	if err != nil {
 		return Credentials{}, false
@@ -78,22 +70,14 @@ func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
 	}
 	ep := strings.TrimRight(endpoint, "/")
 	var keys []string
-	if bucket != "" {
-		if accountID != "" {
-			keys = append(keys, "account:"+accountID+" bucket:"+bucket)
-		}
-		if ep != "" {
-			keys = append(keys, "endpoint:"+ep+" bucket:"+bucket)
-		}
-		if accountID == "" && ep == "" {
-			keys = append(keys, "bucket:"+bucket)
-		}
-	}
 	if accountID != "" {
-		keys = append(keys, "account:"+accountID)
+		keys = append(keys, "account:"+accountID+" bucket:"+bucket)
 	}
 	if ep != "" {
-		keys = append(keys, "endpoint:"+ep)
+		keys = append(keys, "endpoint:"+ep+" bucket:"+bucket)
+	}
+	if accountID == "" && ep == "" {
+		keys = append(keys, "bucket:"+bucket)
 	}
 	for _, k := range keys {
 		if s, ok := sections.get(k); ok {
@@ -109,9 +93,9 @@ func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
 	return Credentials{}, false
 }
 
-// Save upserts credentials and writes the file with 0600 permissions,
-// preserving unrelated entries. bucket == "" stores an account- or
-// endpoint-wide entry. It returns the file path and the section name used.
+// Save upserts this bucket's credentials and writes the file with 0600
+// permissions, preserving unrelated entries. It returns the file path and
+// the section name used.
 func Save(accountID, endpoint, bucket string, c Credentials) (string, string, error) {
 	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 		return "", "", fmt.Errorf("both an access key ID and a secret access key are required")

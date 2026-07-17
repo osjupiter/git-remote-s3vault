@@ -52,10 +52,9 @@ No S3 credentials found (checked the environment and ~/.config/git-remote-r2/cre
 Tip: create an R2 API token scoped to ONLY this bucket (Object Read & Write),
      so that a leaked key cannot touch anything else.
 
-Access Key ID (leave empty to skip and use the AWS default chain): ...
+Access Key ID (leave empty to skip): ...
 Secret Access Key:
-Scope: [B] this bucket only (my-bucket, recommended) / [a] whole account:
-✓ credentials saved to ~/.config/git-remote-r2/credentials [account:... bucket:my-bucket] — for bucket my-bucket
+✓ credentials saved to ~/.config/git-remote-r2/credentials [account:... bucket:my-bucket]
 ✓ bucket reachable; remote is empty (first push will initialize it)
 ✓ repository key created; wrapped for 1 public key(s)
 ✓ recovery key created — store this line in a password manager or on paper:
@@ -70,11 +69,9 @@ All set. Next:
 $ git push -u origin main
 ```
 
-Setup remembers credentials in `~/.config/git-remote-r2/credentials`
-(plaintext, 0600 — the same trust model as other credential files).
-Bucket-scoped entries match the recommended one-token-per-bucket setup;
-choose account-wide instead and every repository on the account shares the
-entry without being asked again.
+Setup remembers the token in `~/.config/git-remote-r2/credentials`
+(plaintext, 0600 — the same trust model as other credential files), one
+entry per bucket, matching the one-token-per-bucket model.
 
 Useful flags: `--remote <name>`, `--recipient <age1...>` (repeatable; add
 teammates or CI public keys), `--account-id <id>`, `--endpoint <url>` (for
@@ -169,14 +166,16 @@ git config > global git config**.
 
 ### Credentials
 
-Resolution order:
+Two sources, checked in order — nothing else is ever consulted (no
+`~/.aws/credentials`, no shared config, no instance roles):
 
 1. environment — `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
    (`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are accepted as aliases)
-2. `~/.config/git-remote-r2/credentials` — written by `setup`; entries can
-   be bucket-scoped (`[account:<id> bucket:<name>]`, matching per-bucket
-   tokens) or account/endpoint-wide, with the most specific entry winning
-3. the standard AWS chain (shared config files, IAM roles)
+2. `~/.config/git-remote-r2/credentials` — written by `setup`, strictly
+   one entry per bucket (`[account:<id> bucket:<name>]`), no fallback
+
+If neither yields a key pair, the helper fails with instructions instead
+of silently probing other credential sources.
 
 Use **bucket-scoped R2 API tokens** (Object Read & Write on a single
 bucket): a leaked key then can't reach anything but that bucket's
