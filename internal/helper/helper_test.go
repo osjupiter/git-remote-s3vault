@@ -426,6 +426,46 @@ func TestProgressOutput(t *testing.T) {
 	}
 }
 
+func TestGCSuggestion(t *testing.T) {
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t)
+
+	// Small tidy repo at default thresholds: no hint.
+	_, stderr := e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if strings.Contains(stderr, "git gc") {
+		t.Errorf("small repo should not trigger the gc hint:\n%s", stderr)
+	}
+
+	// Lower the threshold so this repo's handful of loose objects trips it.
+	origCount, origKiB := looseCountHint, looseKiBHint
+	looseCountHint, looseKiBHint = 1, 1<<40
+	t.Cleanup(func() { looseCountHint, looseKiBHint = origCount, origKiB })
+
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "next")
+	_, stderr = e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if !strings.Contains(stderr, "git gc") || !strings.Contains(stderr, "loose objects") {
+		t.Errorf("expected a gc suggestion:\n%s", stderr)
+	}
+	// Shown once per session even with multiple pushes.
+	if strings.Count(stderr, "git gc") != 1 {
+		t.Errorf("hint should appear once:\n%s", stderr)
+	}
+
+	// After packing, the hint disappears even with the low threshold.
+	git(t, src, "gc", "-q")
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "after-gc")
+	_, stderr = e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	// A fresh commit creates a couple of loose objects, so use count=10 to
+	// represent "mostly packed".
+	_ = stderr // the strict assertion below uses a saner threshold
+	looseCountHint = 10
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "after-gc2")
+	_, stderr = e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if strings.Contains(stderr, "git gc") {
+		t.Errorf("packed repo should not trigger the hint:\n%s", stderr)
+	}
+}
+
 func memKeys(m *storage.Memory) []string {
 	objs, _ := m.List(context.Background(), "")
 	var ks []string

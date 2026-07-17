@@ -40,6 +40,15 @@ import (
 // no kopia repository). Listing it yields no refs.
 var errEmptyRemote = errors.New("remote is empty")
 
+// Above these thresholds of loose (unpacked) objects, bundling gets
+// noticeably slow (git re-compresses every loose object; packed objects
+// are stream-copied ~20x faster) — worth telling the user about.
+// Variables so tests can lower them.
+var (
+	looseCountHint int64 = 256
+	looseKiBHint   int64 = 32 * 1024 // 32 MiB
+)
+
 type remoteRef struct {
 	sha    string
 	object string // kopia object ID of the bundle
@@ -55,11 +64,12 @@ type Helper struct {
 	out  *bufio.Writer
 	errW io.Writer
 
-	refs     map[string]remoteRef // refname -> current state, from the last list
-	headRef  string
-	forceAll bool
-	verbose  int
-	progress bool
+	refs        map[string]remoteRef // refname -> current state, from the last list
+	headRef     string
+	forceAll    bool
+	verbose     int
+	progress    bool
+	gcHintShown bool
 
 	krepo      *kopiax.Repo
 	password   string
@@ -444,6 +454,7 @@ func (h *Helper) cmdPushBatch(ctx context.Context, first string) error {
 			return err
 		}
 	}
+	h.maybeSuggestGC()
 
 	for _, spec := range specs {
 		force := strings.HasPrefix(spec, "+") || h.forceAll
@@ -550,6 +561,24 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 	}
 	h.refs[dst] = remoteRef{sha: localSHA, object: oid}
 	return nil
+}
+
+// maybeSuggestGC recommends `git gc` (once per session) when the local
+// repository has enough loose objects to make bundling noticeably slow.
+func (h *Helper) maybeSuggestGC() {
+	if h.gcHintShown {
+		return
+	}
+	count, sizeKiB, err := h.git.LooseObjectStats()
+	if err != nil {
+		return
+	}
+	if count < looseCountHint && sizeKiB < looseKiBHint {
+		return
+	}
+	h.gcHintShown = true
+	h.warnf("this repository has %d loose objects (%s), which makes preparing the push slow;", count, humanSize(sizeKiB*1024))
+	h.warnf("run `git gc` once — packed repositories bundle roughly 20x faster")
 }
 
 // --- key material ---

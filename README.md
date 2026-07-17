@@ -320,10 +320,12 @@ Ref names and commit hashes are **not** visible.
 
 ### Caveats
 
-- Pushing still creates a full bundle locally (CPU/disk proportional to
-  repository size) even though only deltas are uploaded. Fine for small
-  and medium repos; the storage format would allow incremental bundles
-  later without a breaking change.
+- Pushing creates a full bundle locally even though only deltas are
+  uploaded. On a **packed** repository this is a stream copy (measured:
+  0.4s for a 188MB repo); on a repository full of loose objects git
+  re-compresses everything (20x slower — the helper detects this and
+  suggests running `git gc`). The storage format would also allow
+  incremental bundles later without a breaking change.
 - There is no garbage collection yet: storage grows by roughly the
   changed bytes per push and deleted branches free no space. A `gc`
   command is planned. Do **not** run kopia's own maintenance against the

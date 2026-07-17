@@ -76,6 +76,26 @@ func (g Git) BundleUnbundle(path string) error {
 	return err
 }
 
+// LooseObjectStats reports how many loose (unpacked) objects the local
+// repository has and their total size in KiB. Bundling is much slower on
+// loose objects because git re-deltifies and re-compresses each one,
+// whereas packed objects are stream-copied.
+func (g Git) LooseObjectStats() (count, sizeKiB int64, err error) {
+	out, err := g.run("count-objects", "-v")
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if v, ok := strings.CutPrefix(line, "count: "); ok {
+			fmt.Sscanf(v, "%d", &count)
+		}
+		if v, ok := strings.CutPrefix(line, "size: "); ok {
+			fmt.Sscanf(v, "%d", &sizeKiB)
+		}
+	}
+	return count, sizeKiB, nil
+}
+
 // TempFile creates a temp file for bundle staging, honoring TMPDIR.
 func TempFile(pattern string) (*os.File, error) {
 	return os.CreateTemp("", pattern)
