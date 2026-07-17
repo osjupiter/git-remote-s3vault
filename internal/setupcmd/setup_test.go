@@ -30,8 +30,13 @@ func setupRepo(t *testing.T) {
 
 func run(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	return runWithInput(t, "", args...)
+}
+
+func runWithInput(t *testing.T, input string, args ...string) (string, error) {
+	t.Helper()
 	var out bytes.Buffer
-	err := Run(context.Background(), args, &out, &out)
+	err := Run(context.Background(), args, strings.NewReader(input), &out, &out)
 	return out.String(), err
 }
 
@@ -118,6 +123,64 @@ func TestSetupEncryptionNone(t *testing.T) {
 	}
 	if recips, err := gitOut(t, "config", "--get-all", "remote.origin.agerecipients"); err == nil {
 		t.Errorf("recipients should not be set in plaintext mode: %q", recips)
+	}
+}
+
+func TestWizardBuildsURLFromAnswers(t *testing.T) {
+	setupRepo(t)
+	// Backend 1 (R2), account, bucket, default prefix (repo dir name),
+	// default remote name.
+	out, err := runWithInput(t,
+		"1\nacct42\nmy-bucket\nmy-prefix\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard setup failed: %v\n%s", err, out)
+	}
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://my-bucket/my-prefix" {
+		t.Errorf("remote url = %q", url)
+	}
+	if v, _ := gitOut(t, "config", "remote.origin.accountid"); v != "acct42" {
+		t.Errorf("accountid = %q", v)
+	}
+}
+
+func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
+	setupRepo(t)
+	t.Setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")
+	// Enter accepts backend=2 (env-derived) and the endpoint default; the
+	// prefix default is the repository directory name.
+	out, err := runWithInput(t,
+		"\n\nbkt\n\nupstream\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard setup failed: %v\n%s", err, out)
+	}
+	top, _ := gitOut(t, "rev-parse", "--show-toplevel")
+	wantURL := "r2://bkt/" + filepath.Base(top)
+	if url, _ := gitOut(t, "remote", "get-url", "upstream"); url != wantURL {
+		t.Errorf("remote url = %q, want %q", url, wantURL)
+	}
+	if v, _ := gitOut(t, "config", "remote.upstream.endpoint"); v != "http://127.0.0.1:9000" {
+		t.Errorf("endpoint = %q", v)
+	}
+}
+
+func TestWizardReusesExistingRemote(t *testing.T) {
+	setupRepo(t)
+	gitOut(t, "remote", "add", "origin", "r2://old-bucket/old-prefix")
+	out, err := runWithInput(t, "\n", "--no-verify") // Enter = "Y", use it
+	if err != nil {
+		t.Fatalf("wizard setup failed: %v\n%s", err, out)
+	}
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://old-bucket/old-prefix" {
+		t.Errorf("remote url = %q", url)
+	}
+}
+
+func TestWizardAbortsOnClosedInput(t *testing.T) {
+	setupRepo(t)
+	if out, err := runWithInput(t, "", "--no-verify"); err == nil {
+		t.Fatalf("wizard with no input must abort cleanly:\n%s", out)
 	}
 }
 

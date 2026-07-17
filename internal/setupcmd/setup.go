@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -31,8 +32,9 @@ type stringList []string
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
-// Run executes the setup command. args are the arguments after "setup".
-func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+// Run executes the setup command. args are the arguments after "setup";
+// stdin feeds the interactive wizard that starts when no URL is given.
+func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("git-remote-r2 setup", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	remote := fs.String("remote", "origin", "name of the git remote to create or update")
@@ -45,19 +47,16 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	fs.Var(&extraRecipients, "recipient", "additional age recipient (repeatable): teammate or CI public key")
 
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: git-remote-r2 setup <r2://bucket/prefix> [flags]\n\n")
+		fmt.Fprintf(stderr, "usage: git-remote-r2 setup [r2://bucket/prefix] [flags]\n")
+		fmt.Fprintf(stderr, "(with no URL, an interactive wizard asks for everything)\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
+	if fs.NArg() > 1 {
 		fs.Usage()
-		return fmt.Errorf("exactly one remote URL argument is required")
-	}
-	rawURL := fs.Arg(0)
-	if err := config.ValidateURL(rawURL); err != nil {
-		return err
+		return fmt.Errorf("at most one remote URL argument is allowed")
 	}
 	if *encryption != string(config.EncryptionAge) && *encryption != string(config.EncryptionNone) {
 		return fmt.Errorf("invalid --encryption %q (want \"age\" or \"none\")", *encryption)
@@ -66,6 +65,25 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// Must run inside the repository we are configuring.
 	if err := runGit(nil, "rev-parse", "--git-dir"); err != nil {
 		return fmt.Errorf("not inside a git repository (run this from the repo you want to connect): %w", err)
+	}
+
+	rawURL := fs.Arg(0)
+	if rawURL == "" {
+		answers, err := runWizard(stdin, stdout, *remote)
+		if err != nil {
+			return err
+		}
+		rawURL = answers.rawURL
+		*remote = answers.remoteName
+		if answers.accountID != "" {
+			*accountID = answers.accountID
+		}
+		if answers.endpoint != "" {
+			*endpoint = answers.endpoint
+		}
+	}
+	if err := config.ValidateURL(rawURL); err != nil {
+		return err
 	}
 
 	// 1. Encryption keys.
@@ -188,6 +206,123 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "  # add a teammate: git-remote-r2 key grant <their-age-public-key>\n")
 	}
 	return nil
+}
+
+// wizardAnswers is what the interactive wizard collects.
+type wizardAnswers struct {
+	rawURL     string
+	remoteName string
+	accountID  string
+	endpoint   string
+}
+
+// runWizard interactively assembles the remote URL and backend settings.
+// Every question has a sensible default so Enter-Enter-Enter works.
+func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote string) (*wizardAnswers, error) {
+	in := bufio.NewReader(stdin)
+	ask := func(label, def string) (string, error) {
+		if def != "" {
+			fmt.Fprintf(stdout, "%s [%s]: ", label, def)
+		} else {
+			fmt.Fprintf(stdout, "%s: ", label)
+		}
+		line, err := in.ReadString('\n')
+		if err != nil && line == "" {
+			return "", fmt.Errorf("setup aborted (input closed)")
+		}
+		if v := strings.TrimSpace(line); v != "" {
+			return v, nil
+		}
+		return def, nil
+	}
+
+	fmt.Fprintf(stdout, "Interactive setup — Enter accepts the [default].\n\n")
+	a := &wizardAnswers{}
+
+	// Re-runs: offer the repository's existing r2:// remote right away.
+	if existing, err := gitOutput("remote", "get-url", defaultRemote); err == nil {
+		if config.ValidateURL(existing) == nil {
+			use, err := ask(fmt.Sprintf("Found remote %q → %s — use it?", defaultRemote, existing), "Y")
+			if err != nil {
+				return nil, err
+			}
+			if s := strings.ToLower(use); s == "y" || s == "yes" {
+				a.rawURL = existing
+				a.remoteName = defaultRemote
+				return a, nil
+			}
+		}
+	}
+
+	// Backend: default to whichever the environment already hints at.
+	backendDefault := "1"
+	if os.Getenv("R2_ACCOUNT_ID") == "" && os.Getenv("CLOUDFLARE_ACCOUNT_ID") == "" &&
+		(os.Getenv("AWS_ENDPOINT_URL") != "" || os.Getenv("AWS_ENDPOINT_URL_S3") != "") {
+		backendDefault = "2"
+	}
+	fmt.Fprintf(stdout, "Backend:\n  1) Cloudflare R2\n  2) Other S3-compatible storage (MinIO, AWS S3, ...)\n")
+	for {
+		choice, err := ask("Backend", backendDefault)
+		if err != nil {
+			return nil, err
+		}
+		switch choice {
+		case "1":
+			def := firstNonEmptyEnv("R2_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID")
+			if a.accountID, err = ask("Cloudflare account ID", def); err != nil {
+				return nil, err
+			}
+			if a.accountID == "" {
+				fmt.Fprintf(stdout, "An account ID is required for R2.\n")
+				continue
+			}
+		case "2":
+			def := firstNonEmptyEnv("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+			if a.endpoint, err = ask("Endpoint URL (empty for AWS S3)", def); err != nil {
+				return nil, err
+			}
+		default:
+			fmt.Fprintf(stdout, "Please answer 1 or 2.\n")
+			continue
+		}
+		break
+	}
+
+	var bucket string
+	for bucket == "" {
+		var err error
+		if bucket, err = ask("Bucket name", ""); err != nil {
+			return nil, err
+		}
+	}
+
+	prefixDefault := ""
+	if top, err := gitOutput("rev-parse", "--show-toplevel"); err == nil {
+		prefixDefault = filepath.Base(top)
+	}
+	prefix, err := ask("Prefix inside the bucket", prefixDefault)
+	if err != nil {
+		return nil, err
+	}
+	if a.remoteName, err = ask("Remote name", defaultRemote); err != nil {
+		return nil, err
+	}
+
+	a.rawURL = "r2://" + bucket
+	if p := strings.Trim(prefix, "/"); p != "" {
+		a.rawURL += "/" + p
+	}
+	fmt.Fprintf(stdout, "→ %s\n\n", a.rawURL)
+	return a, nil
+}
+
+func firstNonEmptyEnv(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // reportSavedCredentials tells the user when credentials came from the
@@ -365,6 +500,14 @@ func runGit(env []string, args ...string) error {
 		return fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
+}
+
+func gitOutput(args ...string) (string, error) {
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func gitConfigGetAll(key string) []string {

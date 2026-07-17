@@ -36,9 +36,28 @@ binary.
 
 ## Quick start
 
-From inside any existing repository, one command does the whole thing —
-generates an age key if you don't have one, registers the remote, writes
-repo-local config, and checks that the bucket is reachable:
+From inside any existing repository, run setup with no arguments and
+answer the wizard — it asks for the backend, bucket, and credentials,
+generates the encryption keys, registers the remote, and checks that the
+bucket is reachable:
+
+```console
+$ git-remote-r2 setup
+Interactive setup — Enter accepts the [default].
+
+Backend:
+  1) Cloudflare R2
+  2) Other S3-compatible storage (MinIO, AWS S3, ...)
+Backend [1]:
+Cloudflare account ID: abc123
+Bucket name: my-bucket
+Prefix inside the bucket [my-repo]:
+Remote name [origin]:
+→ r2://my-bucket/my-repo
+...
+```
+
+Passing the URL directly skips the wizard (handy for scripts):
 
 ```console
 $ export R2_ACCOUNT_ID=<cloudflare account id>

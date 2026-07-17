@@ -606,6 +606,53 @@ func TestSavedCredentialsFlow(t *testing.T) {
 	}
 }
 
+// TestInteractiveWizardFlow drives `git-remote-r2 setup` with no arguments,
+// answering the wizard over stdin, then pushes and clones with what it
+// configured.
+func TestInteractiveWizardFlow(t *testing.T) {
+	h := newHarness(t)
+
+	cfgHome := t.TempDir()
+	env := []string{
+		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"XDG_CONFIG_HOME=" + cfgHome,
+	}
+
+	repo := t.TempDir()
+	h.mustGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "w.txt"), []byte("wizard\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "c")
+
+	// Answers: backend (Enter → 2, derived from AWS_ENDPOINT_URL in the
+	// env), endpoint (Enter → env default), bucket, prefix, remote name
+	// (Enter → origin).
+	setup := exec.Command(filepath.Join(h.binDir, "git-remote-r2"), "setup")
+	setup.Dir = repo
+	setup.Env = append(append([]string{}, h.baseEnv...), env...)
+	setup.Stdin = strings.NewReader("\n\n" + bucket + "\nwizard-repo\n\n")
+	out, err := setup.CombinedOutput()
+	if err != nil {
+		t.Fatalf("wizard setup failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "→ r2://"+bucket+"/wizard-repo") {
+		t.Errorf("wizard should echo the assembled URL:\n%s", out)
+	}
+
+	if gout, err := h.git(t, repo, env, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push after wizard: %v\n%s", err, gout)
+	}
+	work := t.TempDir()
+	if gout, err := h.git(t, work, env, "clone", "-q", "r2://"+bucket+"/wizard-repo", "w"); err != nil {
+		t.Fatalf("clone after wizard: %v\n%s", err, gout)
+	}
+	if data, err := os.ReadFile(filepath.Join(work, "w", "w.txt")); err != nil || string(data) != "wizard\n" {
+		t.Fatalf("cloned content: %q, %v", data, err)
+	}
+}
+
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {

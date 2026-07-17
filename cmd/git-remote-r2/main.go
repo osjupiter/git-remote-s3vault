@@ -33,7 +33,7 @@ func main() {
 	// distinguishes a user-typed `git-remote-r2 setup ...` from git driving
 	// a remote that happens to be named "setup".
 	if len(os.Args) >= 2 && os.Args[1] == "setup" && os.Getenv("GIT_DIR") == "" {
-		if err := setupcmd.Run(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil {
+		if err := setupcmd.Run(ctx, os.Args[2:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 			fatal(err)
 		}
 		return
