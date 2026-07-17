@@ -4,77 +4,21 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"filippo.io/age"
+	"github.com/kopia/kopia/repo/blob"
+	"github.com/kopia/kopia/repo/blob/filesystem"
 
 	"github.com/osjupiter/git-remote-r2/internal/config"
 	"github.com/osjupiter/git-remote-r2/internal/keyring"
+	"github.com/osjupiter/git-remote-r2/internal/kopiax"
 	"github.com/osjupiter/git-remote-r2/internal/storage"
 )
-
-// memStore is an in-memory storage.Storage for protocol-level tests.
-type memStore struct {
-	objects map[string][]byte
-	mtimes  map[string]time.Time
-	clock   time.Time
-}
-
-func newMemStore() *memStore {
-	return &memStore{
-		objects: map[string][]byte{},
-		mtimes:  map[string]time.Time{},
-		clock:   time.Unix(1_700_000_000, 0),
-	}
-}
-
-func (m *memStore) List(_ context.Context, prefix string) ([]storage.Object, error) {
-	var out []storage.Object
-	for k, v := range m.objects {
-		if strings.HasPrefix(k, prefix) {
-			out = append(out, storage.Object{Key: k, Size: int64(len(v)), LastModified: m.mtimes[k]})
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
-	return out, nil
-}
-
-func (m *memStore) Get(_ context.Context, key string) (io.ReadCloser, error) {
-	v, ok := m.objects[key]
-	if !ok {
-		return nil, fmt.Errorf("no such key %s", key)
-	}
-	return io.NopCloser(bytes.NewReader(v)), nil
-}
-
-func (m *memStore) Put(_ context.Context, key string, body io.Reader, _ int64) error {
-	data, err := io.ReadAll(body)
-	if err != nil {
-		return err
-	}
-	m.objects[key] = data
-	m.clock = m.clock.Add(time.Second)
-	m.mtimes[key] = m.clock
-	return nil
-}
-
-func (m *memStore) Delete(_ context.Context, key string) error {
-	delete(m.objects, key)
-	delete(m.mtimes, key)
-	return nil
-}
-
-func (m *memStore) Exists(_ context.Context, key string) (bool, error) {
-	_, ok := m.objects[key]
-	return ok, nil
-}
 
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
@@ -102,16 +46,26 @@ func newRepoWithCommit(t *testing.T) string {
 }
 
 type testEnv struct {
-	store *memStore
-	cfg   *config.Config
-	id    *age.X25519Identity
+	store   *storage.Memory // keyring side
+	blobDir string          // kopia blob storage (filesystem-backed)
+	cfg     *config.Config
+	id      *age.X25519Identity
 }
 
+// newTestEnv isolates a helper test completely: in-memory keyring store,
+// filesystem-backed kopia blobs, and private config/cache directories.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
-	// Isolate from the developer's real machine key and recipients file:
-	// the helper's default-path fallbacks resolve via os.UserConfigDir.
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+
+	blobDir := t.TempDir()
+	orig := kopiax.NewBlobStorage
+	kopiax.NewBlobStorage = func(ctx context.Context, _ *config.Config) (blob.Storage, error) {
+		return filesystem.New(ctx, &filesystem.Options{Path: blobDir}, true)
+	}
+	t.Cleanup(func() { kopiax.NewBlobStorage = orig })
+
 	id, err := age.GenerateX25519Identity()
 	if err != nil {
 		t.Fatal(err)
@@ -121,7 +75,8 @@ func newTestEnv(t *testing.T) *testEnv {
 		t.Fatal(err)
 	}
 	return &testEnv{
-		store: newMemStore(),
+		store:   storage.NewMemory(),
+		blobDir: blobDir,
 		cfg: &config.Config{
 			RemoteName:    "origin",
 			Bucket:        "test",
@@ -138,13 +93,8 @@ func newTestEnv(t *testing.T) *testEnv {
 // stdin script and returns stdout.
 func (e *testEnv) runSession(t *testing.T, repoDir, input string) string {
 	t.Helper()
-	t.Chdir(repoDir)
-	var out, errBuf bytes.Buffer
-	h := New(e.cfg, e.store, strings.NewReader(input), &out, &errBuf)
-	if err := h.Run(context.Background()); err != nil {
-		t.Fatalf("helper session failed: %v\nstderr: %s\nstdout: %s", err, errBuf.String(), out.String())
-	}
-	return out.String()
+	out, _ := e.runSessionErr(t, repoDir, input)
+	return out
 }
 
 // runSessionErr is runSession but also returns what the helper wrote to
@@ -160,40 +110,34 @@ func (e *testEnv) runSessionErr(t *testing.T, repoDir, input string) (string, st
 	return out.String(), errBuf.String()
 }
 
-func TestProgressOutput(t *testing.T) {
-	e := newTestEnv(t)
-	src := newRepoWithCommit(t)
-
-	// Default verbosity: pushing narrates the slow steps on stderr.
-	_, stderr := e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
-	for _, want := range []string{"bundling refs/heads/main", "uploading refs/heads/main", "encrypted"} {
-		if !strings.Contains(stderr, want) {
-			t.Errorf("progress output missing %q:\n%s", want, stderr)
+// blobFiles lists the kopia blob storage contents (relative names).
+func (e *testEnv) blobFiles(t *testing.T) []string {
+	t.Helper()
+	var out []string
+	filepath.Walk(e.blobDir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			rel, _ := filepath.Rel(e.blobDir, p)
+			out = append(out, rel)
 		}
-	}
+		return nil
+	})
+	return out
+}
 
-	// Fetch narrates download and decryption.
-	sha := git(t, src, "rev-parse", "HEAD")
-	dst := t.TempDir()
-	git(t, dst, "init", "-q", "-b", "main")
-	_, stderr = e.runSessionErr(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha))
-	for _, want := range []string{"downloading refs/heads/main", "decrypting"} {
-		if !strings.Contains(stderr, want) {
-			t.Errorf("fetch progress missing %q:\n%s", want, stderr)
+// storedBytesContain reports whether any blob contains the needle —
+// used to prove plaintext never reaches storage.
+func (e *testEnv) storedBytesContain(t *testing.T, needle []byte) bool {
+	t.Helper()
+	found := false
+	filepath.Walk(e.blobDir, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			if data, err := os.ReadFile(p); err == nil && bytes.Contains(data, needle) {
+				found = true
+			}
 		}
-	}
-
-	// `git push -q` (verbosity 0) and --no-progress both silence it.
-	git(t, src, "commit", "-q", "--allow-empty", "-m", "next")
-	_, stderr = e.runSessionErr(t, src, "option verbosity 0\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
-	if strings.Contains(stderr, "bundling") {
-		t.Errorf("verbosity 0 should silence progress:\n%s", stderr)
-	}
-	git(t, src, "commit", "-q", "--allow-empty", "-m", "next2")
-	_, stderr = e.runSessionErr(t, src, "option progress false\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
-	if strings.Contains(stderr, "bundling") {
-		t.Errorf("progress=false should silence progress:\n%s", stderr)
-	}
+		return nil
+	})
+	return found
 }
 
 func TestCapabilities(t *testing.T) {
@@ -203,6 +147,14 @@ func TestCapabilities(t *testing.T) {
 		if !strings.Contains(out, cap+"\n") {
 			t.Errorf("capabilities output missing %q: %q", cap, out)
 		}
+	}
+}
+
+func TestListOnFreshRemoteIsEmpty(t *testing.T) {
+	e := newTestEnv(t)
+	out := e.runSession(t, newRepoWithCommit(t), "list\n\n")
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("fresh remote should list nothing: %q", out)
 	}
 }
 
@@ -217,17 +169,12 @@ func TestPushListFetchRoundtrip(t *testing.T) {
 		t.Fatalf("push not acknowledged: %q", out)
 	}
 
-	// The stored bundle must be encrypted and carry the .age suffix.
-	wantKey := "repo/refs/heads/main/" + sha + ".bundle.age"
-	data, ok := e.store.objects[wantKey]
-	if !ok {
-		t.Fatalf("bundle not stored at %s; have %v", wantKey, keys(e.store))
+	// Nothing stored at rest may contain the plaintext.
+	if e.storedBytesContain(t, []byte("hello r2")) {
+		t.Fatal("plaintext leaked into the blob storage")
 	}
-	if !bytes.HasPrefix(data, []byte("age-encryption.org/")) {
-		t.Fatalf("stored object is not an age ciphertext: %q...", data[:min(32, len(data))])
-	}
-	if head := string(e.store.objects["repo/HEAD"]); head != "refs/heads/main" {
-		t.Fatalf("HEAD object = %q", head)
+	if len(e.blobFiles(t)) == 0 {
+		t.Fatal("no kopia blobs written")
 	}
 
 	// A fresh repo lists and fetches the pushed commit.
@@ -249,6 +196,7 @@ func TestNonFastForwardRejectedAndForceAccepted(t *testing.T) {
 	// Rewrite history: the remote sha still exists locally but is no longer
 	// an ancestor.
 	git(t, src, "commit", "-q", "--amend", "-m", "rewritten")
+	sha2 := git(t, src, "rev-parse", "HEAD")
 
 	out := e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
 	if !strings.Contains(out, "error refs/heads/main") || !strings.Contains(out, "non-fast-forward") {
@@ -259,14 +207,13 @@ func TestNonFastForwardRejectedAndForceAccepted(t *testing.T) {
 	if !strings.Contains(out, "ok refs/heads/main\n") {
 		t.Fatalf("force push should succeed: %q", out)
 	}
-
-	// Only one bundle remains after the force push replaced the old one.
-	if n := countBundles(e.store, "repo/refs/heads/main/"); n != 1 {
-		t.Fatalf("expected exactly 1 bundle after force push, got %d: %v", n, keys(e.store))
+	out = e.runSession(t, src, "list\n\n")
+	if !strings.Contains(out, sha2+" refs/heads/main\n") {
+		t.Fatalf("ref not updated after force push: %q", out)
 	}
 }
 
-func TestFastForwardPushReplacesOldBundle(t *testing.T) {
+func TestFastForwardPushUpdatesRef(t *testing.T) {
 	e := newTestEnv(t)
 	src := newRepoWithCommit(t)
 	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
@@ -280,11 +227,9 @@ func TestFastForwardPushReplacesOldBundle(t *testing.T) {
 	if !strings.Contains(out, "ok refs/heads/main\n") {
 		t.Fatalf("fast-forward push failed: %q", out)
 	}
-	if n := countBundles(e.store, "repo/refs/heads/main/"); n != 1 {
-		t.Fatalf("stale bundle not cleaned up: %v", keys(e.store))
-	}
-	if _, ok := e.store.objects["repo/refs/heads/main/"+sha2+".bundle.age"]; !ok {
-		t.Fatalf("new bundle missing: %v", keys(e.store))
+	out = e.runSession(t, src, "list\n\n")
+	if !strings.Contains(out, sha2+" refs/heads/main\n") {
+		t.Fatalf("ref not updated: %q", out)
 	}
 }
 
@@ -298,12 +243,19 @@ func TestDeleteRef(t *testing.T) {
 	if !strings.Contains(out, "ok refs/heads/dev\n") {
 		t.Fatalf("delete push failed: %q", out)
 	}
-	if n := countBundles(e.store, "repo/refs/heads/dev/"); n != 0 {
-		t.Fatalf("ref dir not emptied: %v", keys(e.store))
+	out = e.runSession(t, src, "list\n\n")
+	if strings.Contains(out, "refs/heads/dev") {
+		t.Fatalf("dev should be gone: %q", out)
 	}
 	// main and its HEAD pointer survive.
-	if head := string(e.store.objects["repo/HEAD"]); head != "refs/heads/main" {
-		t.Fatalf("HEAD = %q after deleting dev", head)
+	if !strings.Contains(out, "@refs/heads/main HEAD\n") {
+		t.Fatalf("HEAD lost after deleting dev: %q", out)
+	}
+
+	// Deleting a nonexistent ref reports an error.
+	out = e.runSession(t, src, "list for-push\npush :refs/heads/ghost\n\n")
+	if !strings.Contains(out, "error refs/heads/ghost") {
+		t.Fatalf("deleting a missing ref should error: %q", out)
 	}
 }
 
@@ -334,46 +286,52 @@ func TestPushWithoutAnyKeysFailsClearly(t *testing.T) {
 	if !strings.Contains(out, "error refs/heads/main") || !strings.Contains(out, "public keys") {
 		t.Fatalf("expected a clear no-keys error: %q", out)
 	}
-	if n := countBundles(e.store, "repo/"); n != 0 {
-		t.Fatal("nothing should have been uploaded")
+	if len(e.blobFiles(t)) != 0 {
+		t.Fatal("nothing should have been written to blob storage")
 	}
 }
 
-func TestFirstPushInitializesKeyring(t *testing.T) {
+func TestFirstPushInitializesKeyringAndRepo(t *testing.T) {
 	e := newTestEnv(t)
 	src := newRepoWithCommit(t)
 	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
 
-	pub, ok := e.store.objects["repo/.keys/repo.pub"]
-	if !ok {
-		t.Fatalf("repo.pub not created: %v", keys(e.store))
+	// Keyring: repo.pub plus exactly one wrapped DEK slot.
+	if _, ok := e.store.Bytes("repo/.keys/repo.pub"); !ok {
+		t.Fatal("repo.pub not created")
 	}
-	if !strings.HasPrefix(strings.TrimSpace(string(pub)), "age1") {
-		t.Fatalf("repo.pub is not an age public key: %q", pub)
-	}
-	// Exactly one wrapped DEK slot (for the pusher's own key) + its .pub.
-	var slots int
-	for k := range e.store.objects {
+	slots := 0
+	for _, k := range memKeys(e.store) {
 		if strings.HasPrefix(k, "repo/.keys/dek/") && strings.HasSuffix(k, ".age") {
 			slots++
 		}
 	}
 	if slots != 1 {
-		t.Fatalf("expected 1 wrapped DEK slot, got %d: %v", slots, keys(e.store))
+		t.Fatalf("expected 1 wrapped DEK slot, got %d", slots)
+	}
+
+	// Kopia repository was initialized in blob storage.
+	found := false
+	for _, f := range e.blobFiles(t) {
+		if strings.Contains(f, "kopia.repository") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("kopia repository not initialized: %v", e.blobFiles(t))
 	}
 }
 
-// TestGrantAllowsFetchWithoutRepush is the point of envelope encryption:
+// TestGrantAllowsFetchWithoutRepush is the point of the keyring design:
 // wrapping the DEK for a new member makes ALL existing history readable to
-// them, with zero changes to the stored bundles.
+// them, with zero changes to the stored data.
 func TestGrantAllowsFetchWithoutRepush(t *testing.T) {
 	e := newTestEnv(t)
 	src := newRepoWithCommit(t)
 	sha := git(t, src, "rev-parse", "HEAD")
 	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
 
-	bundleKey := "repo/refs/heads/main/" + sha + ".bundle.age"
-	before := append([]byte{}, e.store.objects[bundleKey]...)
+	before := e.blobFiles(t)
 
 	// Bob appears. Alice (whose identity is e.id) grants him access.
 	bob, err := age.GenerateX25519Identity()
@@ -389,9 +347,10 @@ func TestGrantAllowsFetchWithoutRepush(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The stored bundle was not touched by the grant.
-	if !bytes.Equal(before, e.store.objects[bundleKey]) {
-		t.Fatal("grant must not rewrite existing bundles")
+	// The stored data was not touched by the grant.
+	after := e.blobFiles(t)
+	if strings.Join(before, ",") != strings.Join(after, ",") {
+		t.Fatal("grant must not rewrite stored blobs")
 	}
 
 	// Bob fetches with only his own identity configured.
@@ -408,10 +367,11 @@ func TestGrantAllowsFetchWithoutRepush(t *testing.T) {
 	git(t, dst, "cat-file", "-e", sha)
 }
 
-func TestPlaintextModeWhenExplicitlyDisabled(t *testing.T) {
+func TestPlaintextModeWorksWithoutAnyKeys(t *testing.T) {
 	e := newTestEnv(t)
 	e.cfg.Encryption = config.EncryptionNone
 	e.cfg.Recipients = nil
+	e.cfg.IdentityFiles = nil
 	src := newRepoWithCommit(t)
 	sha := git(t, src, "rev-parse", "HEAD")
 
@@ -419,27 +379,58 @@ func TestPlaintextModeWhenExplicitlyDisabled(t *testing.T) {
 	if !strings.Contains(out, "ok refs/heads/main\n") {
 		t.Fatalf("plaintext push failed: %q", out)
 	}
-	key := "repo/refs/heads/main/" + sha + ".bundle"
-	if _, ok := e.store.objects[key]; !ok {
-		t.Fatalf("plaintext bundle missing at %s: %v", key, keys(e.store))
+	// No keyring is created in plaintext mode.
+	if len(memKeys(e.store)) != 0 {
+		t.Fatalf("plaintext mode must not create key material: %v", memKeys(e.store))
 	}
+	// A fresh clone works without any identity.
+	dst := t.TempDir()
+	git(t, dst, "init", "-q", "-b", "main")
+	e.runSession(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha))
+	git(t, dst, "cat-file", "-e", sha)
 }
 
-func keys(m *memStore) []string {
-	var ks []string
-	for k := range m.objects {
-		ks = append(ks, k)
-	}
-	sort.Strings(ks)
-	return ks
-}
+func TestProgressOutput(t *testing.T) {
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t)
 
-func countBundles(m *memStore, prefix string) int {
-	n := 0
-	for k := range m.objects {
-		if strings.HasPrefix(k, prefix) && strings.Contains(k, ".bundle") {
-			n++
+	// Default verbosity: pushing narrates the slow steps on stderr.
+	_, stderr := e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	for _, want := range []string{"bundling refs/heads/main", "uploading refs/heads/main", "encrypted"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("progress output missing %q:\n%s", want, stderr)
 		}
 	}
-	return n
+
+	// Fetch narrates download and unbundling.
+	sha := git(t, src, "rev-parse", "HEAD")
+	dst := t.TempDir()
+	git(t, dst, "init", "-q", "-b", "main")
+	_, stderr = e.runSessionErr(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha))
+	for _, want := range []string{"downloading refs/heads/main", "unbundling"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("fetch progress missing %q:\n%s", want, stderr)
+		}
+	}
+
+	// `git push -q` (verbosity 0) and --no-progress both silence it.
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "next")
+	_, stderr = e.runSessionErr(t, src, "option verbosity 0\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if strings.Contains(stderr, "bundling") {
+		t.Errorf("verbosity 0 should silence progress:\n%s", stderr)
+	}
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "next2")
+	_, stderr = e.runSessionErr(t, src, "option progress false\nlist for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if strings.Contains(stderr, "bundling") {
+		t.Errorf("progress=false should silence progress:\n%s", stderr)
+	}
+}
+
+func memKeys(m *storage.Memory) []string {
+	objs, _ := m.List(context.Background(), "")
+	var ks []string
+	for _, o := range objs {
+		ks = append(ks, o.Key)
+	}
+	return ks
 }

@@ -6,6 +6,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"os"
@@ -142,6 +143,42 @@ func (h *harness) listKeys(t *testing.T, prefix string) []string {
 	return keys
 }
 
+// storedBytesContain downloads every object under prefix and reports
+// whether any contains needle (proves plaintext never reaches storage).
+func (h *harness) storedBytesContain(t *testing.T, prefix string, needle []byte) bool {
+	t.Helper()
+	for _, k := range h.listKeys(t, prefix) {
+		obj, err := h.s3c.GetObject(context.Background(), &s3.GetObjectInput{
+			Bucket: aws.String(bucket), Key: aws.String(k),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(obj.Body)
+		obj.Body.Close()
+		if bytes.Contains(data, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// bucketSize sums object sizes under prefix.
+func (h *harness) bucketSize(t *testing.T, prefix string) int64 {
+	t.Helper()
+	var total int64
+	resp, err := h.s3c.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket), Prefix: aws.String(prefix),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range resp.Contents {
+		total += aws.ToInt64(o.Size)
+	}
+	return total
+}
+
 func TestEndToEnd(t *testing.T) {
 	h := newHarness(t)
 	remoteURL := "r2://" + bucket + "/project"
@@ -157,24 +194,18 @@ func TestEndToEnd(t *testing.T) {
 	h.mustGit(t, alice, "remote", "add", "origin", remoteURL)
 	h.mustGit(t, alice, "push", "origin", "main")
 
-	// --- everything at rest is an age ciphertext ---
-	keys := h.listKeys(t, "project/refs/")
-	if len(keys) != 1 || !strings.HasSuffix(keys[0], ".bundle.age") {
-		t.Fatalf("expected one .bundle.age object, got %v", keys)
+	// --- everything at rest is opaque and never contains plaintext ---
+	keys := h.listKeys(t, "project/data/")
+	if len(keys) == 0 {
+		t.Fatalf("no kopia blobs stored under project/data/: %v", h.listKeys(t, "project/"))
 	}
-	obj, err := h.s3c.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(bucket), Key: aws.String(keys[0]),
-	})
-	if err != nil {
-		t.Fatal(err)
+	for _, k := range keys {
+		if strings.Contains(k, "bundle") || strings.Contains(k, "refs") || strings.Contains(k, "main") {
+			t.Fatalf("storage key leaks git semantics: %s", k)
+		}
 	}
-	raw, _ := io.ReadAll(obj.Body)
-	obj.Body.Close()
-	if !bytes.HasPrefix(raw, []byte("age-encryption.org/")) {
-		t.Fatalf("object at rest is not age-encrypted: %q...", raw[:min(40, len(raw))])
-	}
-	if bytes.Contains(raw, []byte("hello via r2")) {
-		t.Fatal("plaintext leaked into the stored object")
+	if h.storedBytesContain(t, "project/data/", []byte("hello via r2")) {
+		t.Fatal("plaintext leaked into stored objects")
 	}
 
 	// --- clone into a second working copy ---
@@ -201,11 +232,6 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("pull did not bring bob's commit: %v", err)
 	}
 
-	// --- old bundle is garbage-collected after the fast-forward push ---
-	if keys := h.listKeys(t, "project/refs/heads/main/"); len(keys) != 1 {
-		t.Fatalf("expected exactly one bundle after ff push, got %v", keys)
-	}
-
 	// --- non-fast-forward is rejected, force push wins ---
 	h.mustGit(t, alice, "commit", "-q", "--amend", "-m", "rewritten history")
 	if out, err := h.git(t, alice, nil, "push", "origin", "main"); err == nil {
@@ -224,15 +250,15 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("tags = %q", tags)
 	}
 
-	// --- branch delete removes the remote objects ---
+	// --- branch delete removes the ref ---
 	h.mustGit(t, bob, "checkout", "-q", "-b", "topic")
 	h.mustGit(t, bob, "push", "-q", "origin", "topic")
-	if keys := h.listKeys(t, "project/refs/heads/topic/"); len(keys) != 1 {
-		t.Fatalf("topic branch not pushed: %v", keys)
+	if refs := h.mustGit(t, bob, "ls-remote", "origin"); !strings.Contains(refs, "refs/heads/topic") {
+		t.Fatalf("topic branch not pushed:\n%s", refs)
 	}
 	h.mustGit(t, bob, "push", "-q", "origin", ":topic")
-	if keys := h.listKeys(t, "project/refs/heads/topic/"); len(keys) != 0 {
-		t.Fatalf("topic branch objects not deleted: %v", keys)
+	if refs := h.mustGit(t, bob, "ls-remote", "origin"); strings.Contains(refs, "refs/heads/topic") {
+		t.Fatalf("topic branch still listed after delete:\n%s", refs)
 	}
 }
 
@@ -323,10 +349,12 @@ func TestSetupCommandFlow(t *testing.T) {
 		t.Fatalf("push after setup failed: %v\n%s", err, gout)
 	}
 
-	// Stored object is encrypted with the setup-generated key.
-	keys := h.listKeys(t, "via-setup/refs/heads/main/")
-	if len(keys) != 1 || !strings.HasSuffix(keys[0], ".bundle.age") {
-		t.Fatalf("expected one encrypted bundle, got %v", keys)
+	// Data landed encrypted under the kopia prefix.
+	if len(h.listKeys(t, "via-setup/data/")) == 0 {
+		t.Fatalf("no data stored: %v", h.listKeys(t, "via-setup/"))
+	}
+	if h.storedBytesContain(t, "via-setup/data/", []byte("setup flow")) {
+		t.Fatal("plaintext leaked into stored objects")
 	}
 
 	// Cloning works because the same XDG_CONFIG_HOME holds the identity;
@@ -464,19 +492,8 @@ func TestGrantTeamFlow(t *testing.T) {
 		t.Fatalf("alice push: %v\n%s", err, out)
 	}
 
-	// Snapshot the encrypted bundle as it exists before bob is granted.
-	bundleKeys := h.listKeys(t, "team-repo/refs/heads/main/")
-	if len(bundleKeys) != 1 {
-		t.Fatalf("bundles = %v", bundleKeys)
-	}
-	obj, err := h.s3c.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(bucket), Key: aws.String(bundleKeys[0]),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	bundleBefore, _ := io.ReadAll(obj.Body)
-	obj.Body.Close()
+	// Snapshot the stored data set before bob is granted.
+	dataBefore := strings.Join(h.listKeys(t, "team-repo/data/"), ",")
 
 	// Bob: has an identity, but no access yet — his clone must fail.
 	bob, err := age.GenerateX25519Identity()
@@ -516,17 +533,9 @@ func TestGrantTeamFlow(t *testing.T) {
 		t.Errorf("key list output:\n%s", out)
 	}
 
-	// The bundle bytes are untouched...
-	obj, err = h.s3c.GetObject(context.Background(), &s3.GetObjectInput{
-		Bucket: aws.String(bucket), Key: aws.String(bundleKeys[0]),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	bundleAfter, _ := io.ReadAll(obj.Body)
-	obj.Body.Close()
-	if !bytes.Equal(bundleBefore, bundleAfter) {
-		t.Fatal("grant must not modify stored bundles")
+	// The stored data set is untouched...
+	if dataAfter := strings.Join(h.listKeys(t, "team-repo/data/"), ","); dataAfter != dataBefore {
+		t.Fatal("grant must not modify stored data blobs")
 	}
 
 	// ...yet bob can now clone the pre-grant history.
@@ -650,6 +659,55 @@ func TestInteractiveWizardFlow(t *testing.T) {
 	if data, err := os.ReadFile(filepath.Join(work, "w", "w.txt")); err != nil || string(data) != "wizard\n" {
 		t.Fatalf("cloned content: %q, %v", data, err)
 	}
+}
+
+// TestDedupAcrossPushesAndTags measures, against the real S3 backend,
+// that repeated full-bundle pushes only add roughly the changed bytes:
+// a tag push (identical content) is nearly free and a small commit costs
+// a small fraction of the repository size.
+func TestDedupAcrossPushesAndTags(t *testing.T) {
+	h := newHarness(t)
+	remoteURL := "r2://" + bucket + "/dedup"
+
+	repo := t.TempDir()
+	h.mustGit(t, repo, "init", "-q", "-b", "main")
+	// ~3MB of incompressible data so dedup (not compression) is measured.
+	asset := make([]byte, 3<<20)
+	if _, err := rand.Read(asset); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "asset.bin"), asset, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "base")
+	h.mustGit(t, repo, "remote", "add", "origin", remoteURL)
+	h.mustGit(t, repo, "push", "-q", "origin", "main")
+	base := h.bucketSize(t, "dedup/data/")
+	if base < 3<<20 {
+		t.Fatalf("initial push too small (%d bytes) — asset not stored?", base)
+	}
+
+	// A tag points at identical content: near-free.
+	h.mustGit(t, repo, "tag", "v1")
+	h.mustGit(t, repo, "push", "-q", "origin", "v1")
+	afterTag := h.bucketSize(t, "dedup/data/")
+	if growth := afterTag - base; growth > 512<<10 {
+		t.Fatalf("tag push should be nearly free, grew %d bytes", growth)
+	}
+
+	// A small commit re-pushes the full bundle, but only the delta lands.
+	if err := os.WriteFile(filepath.Join(repo, "note.txt"), []byte("small change\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "small")
+	h.mustGit(t, repo, "push", "-q", "origin", "main")
+	afterCommit := h.bucketSize(t, "dedup/data/")
+	if growth := afterCommit - afterTag; growth > 1<<20 {
+		t.Fatalf("small-commit push should cost a fraction of the repo, grew %d bytes (repo ~%d)", growth, base)
+	}
+	t.Logf("sizes: base=%d afterTag=+%d afterCommit=+%d", base, afterTag-base, afterCommit-afterTag)
 }
 
 func firstLine(s string) string {

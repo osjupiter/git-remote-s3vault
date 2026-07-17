@@ -1,25 +1,28 @@
 // Package helper implements the git remote-helper protocol
-// (gitremote-helpers(7)) on top of an S3-compatible object store.
+// (gitremote-helpers(7)) on top of a kopia repository stored in an
+// S3-compatible bucket.
 //
 // Remote layout:
 //
-//	<prefix>/<refname>/<sha>.bundle.age  encrypted full bundle for a ref
-//	<prefix>/<refname>/<sha>.bundle      plaintext bundle (encryption=none)
-//	<prefix>/HEAD                        plaintext refname of the default branch
+//	<prefix>/.keys/...   keyring: the repository DEK wrapped per member key
+//	<prefix>/data/...    kopia repository (opaque encrypted blobs)
 //
-// Every push uploads a self-contained bundle of the ref's full history and
-// then removes the previous bundle, so the newest object under a ref's
-// directory is always sufficient on its own for cloning and fetching.
+// Each pushed ref stores a self-contained git bundle as a kopia object;
+// kopia's content-defined chunking deduplicates the redundancy between
+// successive bundles and between refs, so a full-bundle push uploads only
+// the changed chunks. Refs and HEAD are kopia manifests. The kopia
+// repository password is the DEK managed by the keyring (an age X25519
+// identity wrapped per member public key).
 package helper
 
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -29,41 +32,37 @@ import (
 	"github.com/osjupiter/git-remote-r2/internal/cryptox"
 	"github.com/osjupiter/git-remote-r2/internal/gitutil"
 	"github.com/osjupiter/git-remote-r2/internal/keyring"
+	"github.com/osjupiter/git-remote-r2/internal/kopiax"
 	"github.com/osjupiter/git-remote-r2/internal/storage"
 )
 
-const (
-	extEncrypted = ".bundle.age"
-	extPlain     = ".bundle"
-	headKeyName  = "HEAD"
-)
-
-var shaRe = regexp.MustCompile(`^[0-9a-f]{40}(?:[0-9a-f]{24})?$`)
+// errEmptyRemote marks a remote that has never been pushed to (no keyring,
+// no kopia repository). Listing it yields no refs.
+var errEmptyRemote = errors.New("remote is empty")
 
 type remoteRef struct {
-	sha  string
-	key  string
-	size int64
+	sha    string
+	object string // kopia object ID of the bundle
 }
 
 // Helper drives one remote-helper session over stdin/stdout.
 type Helper struct {
 	cfg   *config.Config
-	store storage.Storage
+	store storage.Storage // keyring side; lazily built when nil
 	git   gitutil.Git
 
 	in   *bufio.Scanner
 	out  *bufio.Writer
 	errW io.Writer
 
-	refs     map[string]remoteRef // refname -> current bundle, from the last list
+	refs     map[string]remoteRef // refname -> current state, from the last list
 	headRef  string
 	forceAll bool
 	verbose  int
 	progress bool
 
-	repoKey    age.Recipient  // the remote's DEK public key (push side)
-	fetchIDs   []age.Identity // unwrapped DEK + personal identities (fetch side)
+	krepo      *kopiax.Repo
+	password   string
 	identities []age.Identity
 }
 
@@ -85,6 +84,11 @@ func New(cfg *config.Config, store storage.Storage, in io.Reader, out, errW io.W
 
 // Run processes commands until EOF or an empty line outside a batch.
 func (h *Helper) Run(ctx context.Context) error {
+	defer func() {
+		if h.krepo != nil {
+			h.krepo.Close(ctx) //nolint:errcheck // read-side close on exit
+		}
+	}()
 	for h.in.Scan() {
 		line := strings.TrimRight(h.in.Text(), "\n")
 		switch {
@@ -133,9 +137,9 @@ func (h *Helper) warnf(format string, args ...any) {
 	fmt.Fprintf(h.errW, "git-remote-r2: warning: "+format+"\n", args...)
 }
 
-// progressf narrates the slow parts (bundling, encrypting, transferring)
-// on stderr, which git passes through to the user. Silenced by
-// `git push -q` (verbosity 0) and `--no-progress`.
+// progressf narrates the slow parts (bundling, uploading, downloading) on
+// stderr, which git passes through to the user. Silenced by `git push -q`
+// (verbosity 0) and --no-progress.
 func (h *Helper) progressf(format string, args ...any) {
 	if !h.progress || h.verbose < 1 {
 		return
@@ -185,90 +189,114 @@ func (h *Helper) ensureStore(ctx context.Context) error {
 	return nil
 }
 
-// key builds an object key under the configured prefix.
-func (h *Helper) key(parts ...string) string {
-	all := append([]string{h.cfg.Prefix}, parts...)
-	return strings.TrimPrefix(path.Join(all...), "/")
-}
-
-func (h *Helper) ext() string {
-	if h.cfg.Encryption == config.EncryptionNone {
-		return extPlain
+// ensureRepo opens (and with create, initializes) the kopia repository.
+func (h *Helper) ensureRepo(ctx context.Context, create bool) error {
+	if h.krepo != nil {
+		return nil
 	}
-	return extEncrypted
-}
-
-// loadRemoteRefs lists the bucket prefix and reconstructs the remote's refs.
-func (h *Helper) loadRemoteRefs(ctx context.Context) error {
-	if err := h.ensureStore(ctx); err != nil {
+	pw, err := h.repoPassword(ctx, create)
+	if err != nil {
 		return err
 	}
-	objs, err := h.store.List(ctx, h.key()+"/")
+	kr, err := kopiax.Open(ctx, h.cfg, pw, create)
 	if err != nil {
-		if h.cfg.Prefix == "" {
-			objs, err = h.store.List(ctx, "")
-		}
-		if err != nil {
-			return err
-		}
+		return err
+	}
+	h.krepo = kr
+	return nil
+}
+
+// repoPassword resolves the kopia repository password: the plaintext-mode
+// constant, or the DEK unwrapped from (or initialized into) the keyring.
+func (h *Helper) repoPassword(ctx context.Context, create bool) (string, error) {
+	if h.password != "" {
+		return h.password, nil
+	}
+	if h.cfg.Encryption == config.EncryptionNone {
+		h.password = kopiax.PlaintextPassword
+		return h.password, nil
+	}
+	if err := h.ensureStore(ctx); err != nil {
+		return "", err
+	}
+	kr := keyring.New(h.store, h.cfg.Prefix)
+	repoPub, exists, err := kr.RepoRecipient(ctx)
+	if err != nil {
+		return "", err
 	}
 
-	type candidate struct {
-		storage.Object
-		sha string
+	if !exists {
+		if !create {
+			return "", errEmptyRemote
+		}
+		specs, err := h.initialRecipientSpecs()
+		if err != nil {
+			return "", err
+		}
+		dek, err := kr.Init(ctx, specs)
+		if err != nil {
+			return "", err
+		}
+		h.warnf("initialized repository key; access granted to %d public key(s)", len(specs))
+		h.warnf("no recovery key was created; run `git-remote-r2 key recovery-init` to add one")
+		h.password = dek.String()
+		return h.password, nil
 	}
-	byRef := map[string][]candidate{}
+
+	ids, err := h.loadIdentities()
+	if err != nil {
+		return "", err
+	}
+	dek, ok, err := kr.Unwrap(ctx, ids)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		// The identity file may hold the DEK itself.
+		if x25519, okR := repoPub.(*age.X25519Recipient); okR {
+			for _, id := range ids {
+				if x, okX := id.(*age.X25519Identity); okX && x.Recipient().String() == x25519.String() {
+					h.password = x.String()
+					return h.password, nil
+				}
+			}
+		}
+		return "", fmt.Errorf("none of your keys can unwrap the repository key; " +
+			"ask a member to run `git-remote-r2 key grant <your-public-key>` " +
+			"or recover with `git-remote-r2 key recover`")
+	}
+	h.password = dek.String()
+	return h.password, nil
+}
+
+// loadRemoteRefs reads refs and HEAD from the kopia repository. A remote
+// that was never pushed to yields empty results.
+func (h *Helper) loadRemoteRefs(ctx context.Context) error {
 	h.refs = map[string]remoteRef{}
 	h.headRef = ""
 
-	base := h.key()
-	for _, o := range objs {
-		rel := o.Key
-		if base != "" {
-			rel = strings.TrimPrefix(rel, base+"/")
-		}
-		if rel == headKeyName || rel == keyring.KeysDir ||
-			strings.HasPrefix(rel, keyring.KeysDir+"/") {
-			continue // HEAD and key material are not ref bundles
-		}
-		var ext string
-		switch {
-		case strings.HasSuffix(rel, extEncrypted):
-			ext = extEncrypted
-		case strings.HasSuffix(rel, extPlain):
-			ext = extPlain
-		default:
-			continue
-		}
-		dir, file := path.Split(strings.TrimSuffix(rel, ext))
-		refname := strings.TrimSuffix(dir, "/")
-		if refname == "" || !shaRe.MatchString(file) {
-			continue
-		}
-		byRef[refname] = append(byRef[refname], candidate{o, file})
+	err := h.ensureRepo(ctx, false)
+	if errors.Is(err, errEmptyRemote) || errors.Is(err, kopiax.ErrNotInitialized) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 
-	for refname, cands := range byRef {
-		sort.Slice(cands, func(i, j int) bool {
-			return cands[i].LastModified.After(cands[j].LastModified)
-		})
-		if len(cands) > 1 {
-			h.warnf("ref %s has %d bundles; using the newest (%s). Concurrent pushes may have raced.",
-				refname, len(cands), cands[0].sha[:12])
-		}
-		h.refs[refname] = remoteRef{sha: cands[0].sha, key: cands[0].Key, size: cands[0].Size}
+	refs, err := h.krepo.Refs(ctx)
+	if err != nil {
+		return err
+	}
+	for name, ri := range refs {
+		h.refs[name] = remoteRef{sha: ri.SHA, object: ri.Object}
 	}
 
-	// Resolve the remote HEAD (symbolic ref for clone's default branch).
-	if rc, err := h.store.Get(ctx, h.key(headKeyName)); err == nil {
-		data, rerr := io.ReadAll(io.LimitReader(rc, 4096))
-		rc.Close()
-		if rerr == nil {
-			target := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(data)), "ref:"))
-			if _, ok := h.refs[target]; ok {
-				h.headRef = target
-			}
-		}
+	head, err := h.krepo.Head(ctx)
+	if err != nil {
+		return err
+	}
+	if _, ok := h.refs[head]; ok {
+		h.headRef = head
 	}
 	if h.headRef == "" {
 		for _, fallback := range []string{"refs/heads/main", "refs/heads/master"} {
@@ -358,7 +386,7 @@ func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
 		found = &rr
 	} else {
 		// The exact sha may live under another ref, or the listing may be
-		// stale; search all known bundles for it.
+		// stale; search all known refs for it.
 		for _, rr := range h.refs {
 			if rr.sha == sha {
 				found = &rr
@@ -366,43 +394,30 @@ func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
 			}
 		}
 	}
-	if found == nil {
+	if found == nil || found.object == "" {
 		return fmt.Errorf("no bundle found for %s", sha)
 	}
-	key := found.key
-	h.progressf("downloading %s (%s)", name, humanSize(found.size))
 
-	body, err := h.store.Get(ctx, key)
+	body, size, err := h.krepo.OpenBundle(ctx, found.object)
 	if err != nil {
 		return err
 	}
 	defer body.Close()
-
-	var payload io.Reader = body
-	if strings.HasSuffix(key, extEncrypted) {
-		ids, err := h.fetchIdentities(ctx)
-		if err != nil {
-			return err
-		}
-		h.progressf("decrypting and unbundling %s", name)
-		payload, err = cryptox.Decrypt(body, ids)
-		if err != nil {
-			return fmt.Errorf("decrypting bundle: %w (is your key granted access? see `git-remote-r2 key list`)", err)
-		}
-	}
+	h.progressf("downloading %s (%s)", name, humanSize(size))
 
 	tmp, err := gitutil.TempFile("git-remote-r2-fetch-*.bundle")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-	if _, err := io.Copy(tmp, payload); err != nil {
+	if _, err := io.Copy(tmp, body); err != nil {
 		tmp.Close()
 		return err
 	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+	h.progressf("unbundling %s", name)
 	return h.git.BundleUnbundle(tmp.Name())
 }
 
@@ -455,21 +470,15 @@ func (h *Helper) cmdPushBatch(ctx context.Context, first string) error {
 }
 
 func (h *Helper) pushDelete(ctx context.Context, dst string) error {
-	objs, err := h.store.List(ctx, h.key(dst)+"/")
-	if err != nil {
-		return err
-	}
-	if len(objs) == 0 {
+	if _, ok := h.refs[dst]; !ok || h.krepo == nil {
 		return fmt.Errorf("remote ref does not exist")
 	}
-	for _, o := range objs {
-		if err := h.store.Delete(ctx, o.Key); err != nil {
-			return err
-		}
+	if err := h.krepo.DeleteRef(ctx, dst); err != nil {
+		return err
 	}
 	delete(h.refs, dst)
 	if h.headRef == dst {
-		if err := h.store.Delete(ctx, h.key(headKeyName)); err != nil {
+		if err := h.krepo.DeleteHead(ctx); err != nil {
 			h.warnf("could not delete remote HEAD: %v", err)
 		}
 		h.headRef = ""
@@ -496,7 +505,9 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 		}
 	}
 
-	// 1. Bundle the full history of the pushed commit.
+	// 1. Bundle the full history of the pushed commit. Deduplication
+	// against everything already stored happens inside kopia, so only the
+	// changed chunks are actually uploaded.
 	h.progressf("bundling %s (full history)", dst)
 	tmp, err := gitutil.TempFile("git-remote-r2-push-*.bundle")
 	if err != nil {
@@ -509,38 +520,11 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 		return err
 	}
 
-	// 2. Encrypt (unless explicitly disabled) into the upload staging file.
-	uploadPath := tmpName
-	if h.cfg.Encryption == config.EncryptionAge {
-		repoKey, err := h.ensureRepoKey(ctx)
-		if err != nil {
-			return err
-		}
-		recips := []age.Recipient{repoKey}
-		enc, err := gitutil.TempFile("git-remote-r2-push-*.bundle.age")
-		if err != nil {
-			return err
-		}
-		encName := enc.Name()
-		defer os.Remove(encName)
-		src, err := os.Open(tmpName)
-		if err != nil {
-			enc.Close()
-			return err
-		}
-		encErr := cryptox.Encrypt(enc, src, recips)
-		src.Close()
-		if cerr := enc.Close(); encErr == nil {
-			encErr = cerr
-		}
-		if encErr != nil {
-			return encErr
-		}
-		uploadPath = encName
+	// 2. Store bundle + ref (+ HEAD on the first branch) in one session.
+	if err := h.ensureRepo(ctx, true); err != nil {
+		return err
 	}
-
-	// 3. Upload, then clean up superseded bundles for this ref.
-	f, err := os.Open(uploadPath)
+	f, err := os.Open(tmpName)
 	if err != nil {
 		return err
 	}
@@ -549,39 +533,22 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 	if err != nil {
 		return err
 	}
-	newKey := h.key(dst, localSHA+h.ext())
-	if h.cfg.Encryption == config.EncryptionAge {
-		h.progressf("uploading %s (%s, encrypted)", dst, humanSize(st.Size()))
+	if h.cfg.Encryption == config.EncryptionNone {
+		h.progressf("uploading %s (%s bundle, deduplicated, PLAINTEXT)", dst, humanSize(st.Size()))
 	} else {
-		h.progressf("uploading %s (%s, PLAINTEXT)", dst, humanSize(st.Size()))
+		h.progressf("uploading %s (%s bundle, deduplicated, encrypted)", dst, humanSize(st.Size()))
 	}
-	h.logf("object key: %s", newKey)
-	if err := h.store.Put(ctx, newKey, f, st.Size()); err != nil {
+	setHead := h.headRef == "" && strings.HasPrefix(dst, "refs/heads/")
+	oid, err := h.krepo.PushRef(ctx, dst, localSHA, f, setHead)
+	if err != nil {
 		return err
 	}
+	h.logf("bundle stored as kopia object %s", oid)
 
-	if stale, err := h.store.List(ctx, h.key(dst)+"/"); err == nil {
-		for _, o := range stale {
-			if o.Key != newKey {
-				if derr := h.store.Delete(ctx, o.Key); derr != nil {
-					h.warnf("could not delete stale bundle %s: %v", o.Key, derr)
-				}
-			}
-		}
-	} else {
-		h.warnf("could not list stale bundles for %s: %v", dst, err)
+	if setHead {
+		h.headRef = dst
 	}
-
-	// 4. Make sure the remote has a HEAD so clones pick a default branch.
-	if h.headRef == "" && strings.HasPrefix(dst, "refs/heads/") {
-		if err := h.store.Put(ctx, h.key(headKeyName), strings.NewReader(dst), int64(len(dst))); err != nil {
-			h.warnf("could not write remote HEAD: %v", err)
-		} else {
-			h.headRef = dst
-		}
-	}
-
-	h.refs[dst] = remoteRef{sha: localSHA, key: newKey}
+	h.refs[dst] = remoteRef{sha: localSHA, object: oid}
 	return nil
 }
 
@@ -597,35 +564,6 @@ func defaultConfigPath(name string) string {
 		return ""
 	}
 	return p
-}
-
-// ensureRepoKey returns the remote's DEK public key, initializing the
-// keyring on first push: a fresh DEK is generated and wrapped to every
-// configured (or identity-derived) public key.
-func (h *Helper) ensureRepoKey(ctx context.Context) (age.Recipient, error) {
-	if h.repoKey != nil {
-		return h.repoKey, nil
-	}
-	kr := keyring.New(h.store, h.cfg.Prefix)
-	if r, ok, err := kr.RepoRecipient(ctx); err != nil {
-		return nil, err
-	} else if ok {
-		h.repoKey = r
-		return r, nil
-	}
-
-	specs, err := h.initialRecipientSpecs()
-	if err != nil {
-		return nil, err
-	}
-	dek, err := kr.Init(ctx, specs)
-	if err != nil {
-		return nil, err
-	}
-	h.warnf("initialized repository key; access granted to %d public key(s)", len(specs))
-	h.warnf("no recovery key was created; run `git-remote-r2 key recovery-init` to add one")
-	h.repoKey = dek.Recipient()
-	return h.repoKey, nil
 }
 
 // initialRecipientSpecs decides who can unwrap a brand-new repository key:
@@ -667,29 +605,6 @@ func (h *Helper) initialRecipientSpecs() ([]string, error) {
 	return specs, nil
 }
 
-// fetchIdentities returns everything usable to decrypt bundles: the
-// repository DEK (unwrapped from the keyring with the machine identities)
-// first, then the machine identities themselves, which also covers an
-// identity file that holds the repository key directly.
-func (h *Helper) fetchIdentities(ctx context.Context) ([]age.Identity, error) {
-	if h.fetchIDs != nil {
-		return h.fetchIDs, nil
-	}
-	personal, err := h.loadIdentities()
-	if err != nil {
-		return nil, err
-	}
-	ids := personal
-	kr := keyring.New(h.store, h.cfg.Prefix)
-	if dek, ok, err := kr.Unwrap(ctx, personal); err != nil {
-		h.warnf("reading repository keyring: %v", err)
-	} else if ok {
-		ids = append([]age.Identity{dek}, personal...)
-	}
-	h.fetchIDs = ids
-	return ids, nil
-}
-
 func (h *Helper) loadIdentities() ([]age.Identity, error) {
 	if h.identities != nil {
 		return h.identities, nil
@@ -701,7 +616,7 @@ func (h *Helper) loadIdentities() ([]age.Identity, error) {
 		}
 	}
 	if len(files) == 0 {
-		return nil, fmt.Errorf("bundle is age-encrypted but no identity is configured; " +
+		return nil, fmt.Errorf("the remote is encrypted but no machine key is configured; " +
 			"set r2.ageIdentityFile (git config) or GIT_REMOTE_R2_AGE_IDENTITY_FILE")
 	}
 	ids, err := cryptox.LoadIdentityFiles(files)

@@ -1,7 +1,8 @@
 # git-remote-r2
 
 A git remote helper that stores repositories in **Cloudflare R2** (or any
-S3-compatible object store) as **age-encrypted** git bundles.
+S3-compatible object store), **end-to-end encrypted and deduplicated** —
+age-based key management on top of kopia's storage engine.
 
 ```console
 $ git remote add origin r2://my-bucket/my-repo
@@ -13,16 +14,21 @@ $ git clone r2://my-bucket/my-repo
 
 - **Single static binary.** Written in Go — no Python, no pip, no runtime.
   Drop `git-remote-r2` on your `PATH` and git finds it.
-- **Encrypted before it leaves your machine.** Every bundle is encrypted
-  with [age](https://age-encryption.org) client-side, by default, always.
-  Your storage provider only ever sees ciphertext. Plaintext storage
-  requires an explicit opt-out.
+- **Encrypted before it leaves your machine.** Everything is encrypted
+  client-side, by default, always; keys are managed sops-style with
+  [age](https://age-encryption.org) (grant a teammate with one command, a
+  printed recovery key restores access from nothing). The storage provider
+  sees only opaque ciphertext — not even branch names.
+- **Deduplicated.** Data rides on [kopia](https://kopia.io)'s
+  content-defined chunking: pushes upload only changed chunks, and tags or
+  branches sharing history cost almost nothing.
 - **R2 first-class.** Point it at a Cloudflare account ID and the endpoint,
   region, and addressing style are derived for you. Generic S3 (AWS, MinIO,
   Garage, Ceph, …) works through the same binary.
 - **Tested for real.** The e2e suite spins up MinIO in a testcontainer and
   drives the compiled binary through actual `git push`, `clone`, `pull`,
-  force-pushes, tags, and branch deletion.
+  force-pushes, tags, branch deletion, key grants, disaster recovery, and
+  measured deduplication.
 
 ## Install
 
@@ -225,29 +231,23 @@ $ git clone r2://my-bucket/my-repo
 
 ## How it works
 
-### Envelope encryption (sops-style)
+### Two layers: age for keys, kopia for data
 
-Every repository gets its own **data-encryption key (DEK)** — an age
-X25519 keypair generated automatically on setup / first push. Bundles are
-encrypted only to the DEK; the DEK's secret half is stored in the bucket,
-wrapped once per member public key:
+The bucket holds two things, cleanly separated:
 
 ```
 <prefix>/.keys/repo.pub           # DEK public key (plaintext — it's public)
-<prefix>/.keys/dek/<label>.age    # DEK secret, wrapped to one member key
+<prefix>/.keys/dek/<label>.age    # DEK, wrapped to one member key (age)
 <prefix>/.keys/dek/<label>.pub    # that member's public key (for `key list`)
-<prefix>/refs/heads/main/<sha>.bundle.age   # full-history bundle → DEK only
-<prefix>/HEAD                     # default branch pointer
+<prefix>/data/...                 # kopia repository: opaque encrypted blobs
 ```
 
-Because history is encrypted to the per-repo DEK rather than to member
-keys directly:
-
-- **Granting access is O(1)**: wrap the DEK for one more public key —
-  the entire existing history becomes readable to them instantly, with no
-  re-encryption and no re-push.
-- **Repos are isolated**: each has its own DEK, so one machine key can
-  serve every repo without coupling them cryptographically.
+**Key layer (age, sops-style).** Every repository gets its own
+**data-encryption key (DEK)**, generated on setup / first push. It is
+stored in the bucket wrapped once per member public key. Granting access
+is O(1): wrap the DEK for one more key and the entire existing history
+becomes readable instantly, with no re-encryption and no re-push. Repos
+stay isolated — one machine key serves every repo without coupling them.
 
 ```console
 $ git-remote-r2 key grant age1<teammate> ; git-remote-r2 key list ; git-remote-r2 key revoke <label>
@@ -258,34 +258,43 @@ but anyone who already unwrapped it may have cached it — a hard cut-off
 additionally requires rotating the DEK and re-pushing (planned as
 `key rotate`).
 
-### Storage model
+**Data layer ([kopia](https://kopia.io)'s repository engine).** Each push
+stores a self-contained git bundle of the ref's full history as a kopia
+object; refs and HEAD are kopia manifests. The DEK is the kopia
+repository password. kopia provides content-defined chunking with
+**deduplication**, AES-256-GCM encryption, packing, and local caching
+(under `~/.cache/git-remote-r2/`) — so although every push writes a
+"full" bundle, only the chunks that actually changed are uploaded and
+stored. Measured in the e2e suite: on a ~3 MB repository, pushing a tag
+adds ~5 KB and a small commit ~300 KB.
 
-Each push uploads a **self-contained git bundle** of the ref's full
-history:
-
-- `list` reconstructs the remote's refs from object keys — no index files,
-  no extra state to corrupt.
-- Pushes enforce fast-forward unless `--force` is used (ancestry is checked
-  locally against the advertised remote sha).
-- After a successful upload the superseded bundle is deleted, so a ref's
-  directory converges to a single object.
+- Branches and tags cost almost nothing: shared history is stored once.
+- Pushes enforce fast-forward unless `--force` is used (ancestry is
+  checked locally against the advertised remote sha).
+- `list`/`fetch` need no local bookkeeping: git's own object database
+  answers "do I already have this?".
 
 ### Threat model
 
-Bundle **contents** (commits, trees, blobs, messages) are encrypted
-end-to-end; the storage provider sees only ciphertext and the DEK never
-exists unencrypted outside your machines. Object **keys** are not
-encrypted: ref names, member count (one wrapped-DEK slot each), object
-sizes, and push timing are visible to the provider. Don't put secrets in
-branch names.
+Repository **contents** (commits, trees, blobs, messages, file names, ref
+names) are encrypted end-to-end; the DEK never exists unencrypted outside
+your machines. The storage provider sees only: opaque blob names, blob
+count/sizes, access timing, the fact that the format is kopia, and the
+keyring metadata (how many member slots exist and their public keys).
+Ref names and commit hashes are **not** visible.
 
 ### Caveats
 
-- Full-history bundles make push cost grow with repository size — great
-  for small/medium private repos, wrong tool for monorepos.
-- Two clients force-pushing the same ref at the same instant can race;
-  the helper detects leftover duplicate bundles and warns on the next
-  operation.
+- Pushing still creates a full bundle locally (CPU/disk proportional to
+  repository size) even though only deltas are uploaded. Fine for small
+  and medium repos; the storage format would allow incremental bundles
+  later without a breaking change.
+- There is no garbage collection yet: storage grows by roughly the
+  changed bytes per push and deleted branches free no space. A `gc`
+  command is planned. Do **not** run kopia's own maintenance against the
+  bucket — it does not know about the helper's manifests.
+- Two clients force-pushing the same ref at the same instant race
+  last-writer-wins; the ref converges to one of them.
 
 ## Development
 
