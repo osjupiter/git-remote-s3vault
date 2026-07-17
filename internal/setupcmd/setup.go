@@ -69,6 +69,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	rawURL := fs.Arg(0)
 	var wizKey *keyCandidate
+	var wizCredsSaved bool
 	if rawURL == "" {
 		answers, err := runWizard(stdin, stdout, *remote, *encryption)
 		if err != nil {
@@ -77,6 +78,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		rawURL = answers.rawURL
 		*remote = answers.remoteName
 		wizKey = answers.key
+		wizCredsSaved = answers.credsSaved
 		if answers.accountID != "" {
 			*accountID = answers.accountID
 		}
@@ -193,7 +195,9 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		if err != nil {
 			return err
 		}
-		reportSavedCredentials(cfg, stdout)
+		if !wizCredsSaved {
+			reportSavedCredentials(cfg, stdout)
+		}
 		if cfg.AccessKeyID == "" && promptCredentials(cfg, stdout) {
 			if cfg, err = config.Load(*remote, rawURL); err != nil {
 				return err
@@ -233,6 +237,7 @@ type wizardAnswers struct {
 	accountID  string
 	endpoint   string
 	key        *keyCandidate
+	credsSaved bool
 }
 
 // runWizard interactively assembles the remote URL, backend settings, and
@@ -313,6 +318,30 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 		break
 	}
 
+	// Credentials come right after the backend, before the bucket, so all
+	// connection settings are entered in one block.
+	var creds *credstore.Credentials
+	if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
+		fmt.Fprintf(stdout, "✓ using credentials from the environment\n")
+	} else {
+		fmt.Fprintf(stdout, "Credentials — tip: use an API token scoped to ONLY the target bucket\n")
+		fmt.Fprintf(stdout, "(Object Read & Write), so a leaked key cannot touch anything else.\n")
+		keyID, err := ask("Access Key ID (empty to configure later)", "")
+		if err != nil {
+			return nil, err
+		}
+		if keyID != "" {
+			secret, err := askSecret(in, stdout, "Secret Access Key")
+			if err != nil {
+				return nil, err
+			}
+			if secret == "" {
+				return nil, fmt.Errorf("empty secret access key")
+			}
+			creds = &credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret}
+		}
+	}
+
 	var bucket string
 	for bucket == "" {
 		var err error
@@ -353,8 +382,41 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 	if s := strings.ToLower(confirm); s != "y" && s != "yes" {
 		return nil, fmt.Errorf("setup aborted; nothing was changed")
 	}
+
+	// Persist credentials only after the confirmation: an aborted wizard
+	// leaves no trace.
+	if creds != nil {
+		path, section, err := credstore.Save(a.accountID, a.endpoint, bucket, *creds)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(stdout, "✓ credentials saved to %s [%s]\n", path, section)
+		a.credsSaved = true
+	}
 	fmt.Fprintf(stdout, "\n")
 	return a, nil
+}
+
+// askSecret reads a secret with echo off on the controlling terminal,
+// falling back to the wizard's input stream when no terminal is available
+// (piped input, tests).
+func askSecret(in *bufio.Reader, stdout io.Writer, label string) (string, error) {
+	if tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0); err == nil {
+		defer tty.Close()
+		fmt.Fprintf(tty, "%s: ", label)
+		b, rerr := term.ReadPassword(int(tty.Fd()))
+		fmt.Fprintln(tty)
+		if rerr != nil {
+			return "", rerr
+		}
+		return sanitizeAnswer(string(b)), nil
+	}
+	fmt.Fprintf(stdout, "%s: ", label)
+	line, err := in.ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("setup aborted (input closed)")
+	}
+	return sanitizeAnswer(line), nil
 }
 
 // sanitizeAnswer strips bracketed-paste markers and control characters

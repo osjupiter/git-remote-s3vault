@@ -15,6 +15,8 @@ import (
 
 	"filippo.io/age"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/osjupiter/git-remote-r2/internal/credstore"
 )
 
 func gitOut(t *testing.T, args ...string) (string, error) {
@@ -140,7 +142,7 @@ func TestWizardBuildsURLFromAnswers(t *testing.T) {
 	// Backend 1 (R2), account, bucket, default prefix (repo dir name),
 	// default remote name.
 	out, err := runWithInput(t,
-		"1\nacct42\nmy-bucket\nmy-prefix\n\n\n",
+		"1\nacct42\n\nmy-bucket\nmy-prefix\n\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
@@ -156,6 +158,10 @@ func TestWizardBuildsURLFromAnswers(t *testing.T) {
 func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 	setupRepo(t)
 	t.Setenv("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")
+	// With credentials in the environment the wizard skips its credential
+	// questions entirely.
+	t.Setenv("AWS_ACCESS_KEY_ID", "env-key")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "env-secret")
 	// Enter accepts backend=2 (env-derived) and the endpoint default; the
 	// prefix default is the repository directory name.
 	out, err := runWithInput(t,
@@ -163,6 +169,9 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "using credentials from the environment") {
+		t.Errorf("credential questions should be skipped with env creds:\n%s", out)
 	}
 	top, _ := gitOut(t, "rev-parse", "--show-toplevel")
 	wantURL := "r2://bkt/" + filepath.Base(top)
@@ -186,10 +195,41 @@ func TestWizardReusesExistingRemote(t *testing.T) {
 	}
 }
 
+func TestWizardCollectsCredentialsBeforeBucket(t *testing.T) {
+	setupRepo(t)
+	// Backend, account, THEN access key + secret, THEN bucket etc.
+	out, err := runWithInput(t,
+		"1\nacct42\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard failed: %v\n%s", err, out)
+	}
+	c, ok := credstore.Lookup("acct42", "", "my-bucket")
+	if !ok || c.AccessKeyID != "AKIA123" || c.SecretAccessKey != "topsecret" {
+		t.Fatalf("credentials not saved for the chosen bucket: %+v, %v", c, ok)
+	}
+	if !strings.Contains(out, "credentials saved") {
+		t.Errorf("missing save confirmation:\n%s", out)
+	}
+}
+
+func TestWizardAbortDiscardsEnteredCredentials(t *testing.T) {
+	setupRepo(t)
+	out, err := runWithInput(t,
+		"1\nacct42\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\nn\n", // decline at confirm
+		"--no-verify")
+	if err == nil {
+		t.Fatalf("declined confirmation must abort:\n%s", out)
+	}
+	if _, ok := credstore.Lookup("acct42", "", "my-bucket"); ok {
+		t.Fatal("aborting the wizard must not persist credentials")
+	}
+}
+
 func TestWizardConfirmationAbortsCleanly(t *testing.T) {
 	setupRepo(t)
 	out, err := runWithInput(t,
-		"1\nacct42\nmy-bucket\nmy-prefix\n\nn\n", // "n" at the final confirmation
+		"1\nacct42\n\nmy-bucket\nmy-prefix\n\nn\n", // "n" at the final confirmation
 		"--no-verify")
 	if err == nil {
 		t.Fatalf("declined confirmation must abort:\n%s", out)
@@ -206,7 +246,7 @@ func TestWizardStripsPasteArtifacts(t *testing.T) {
 	// would have been — here the sanitized empty-ish answer falls back to
 	// the default instead.
 	out, err := runWithInput(t,
-		"1\nacct42\n\x1b[200~my-bucket\x1b[201~\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
+		"1\nacct42\n\n\x1b[200~my-bucket\x1b[201~\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -278,7 +318,7 @@ func TestWizardKeySelectionPicksSpecificAgeKey(t *testing.T) {
 
 	// Candidates: 1,2 = age keys, 3 = generate. Pick the second age key.
 	out, err := runWithInput(t,
-		"1\nacct\nbkt\npfx\n\n2\n\n",
+		"1\nacct\n\nbkt\npfx\n\n2\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -296,7 +336,7 @@ func TestWizardKeySelectionSSH(t *testing.T) {
 
 	// Candidates: 1,2 age; 3 SSH; 4 generate. Pick the SSH key.
 	out, err := runWithInput(t,
-		"1\nacct\nbkt\npfx\n\n3\n\n",
+		"1\nacct\n\nbkt\npfx\n\n3\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -316,7 +356,7 @@ func TestWizardSkipsPassphraseProtectedSSHKeys(t *testing.T) {
 
 	// Locked key is not offered: candidates are 2 age keys + generate.
 	out, err := runWithInput(t,
-		"1\nacct\nbkt\npfx\n\n1\n\n",
+		"1\nacct\n\nbkt\npfx\n\n1\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)

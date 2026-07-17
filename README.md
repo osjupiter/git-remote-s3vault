@@ -50,6 +50,10 @@ Backend:
   2) Other S3-compatible storage (MinIO, AWS S3, ...)
 Backend [1]:
 Cloudflare account ID: abc123
+Credentials — tip: use an API token scoped to ONLY the target bucket
+(Object Read & Write), so a leaked key cannot touch anything else.
+Access Key ID (empty to configure later): ...
+Secret Access Key:
 Bucket name: my-bucket
 Prefix inside the bucket [my-repo]:
 Remote name [origin]:
