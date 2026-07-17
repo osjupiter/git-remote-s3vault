@@ -33,7 +33,7 @@ func TestParseURL(t *testing.T) {
 		{"r2:///no-bucket", "", "", true},
 	}
 	for _, tc := range cases {
-		c, err := load("origin", tc.url, fakeGit{}, env(nil))
+		c, err := load("origin", tc.url, fakeGit{}, env(nil), nil)
 		if tc.wantErr {
 			if err == nil {
 				t.Errorf("%s: expected error, got %+v", tc.url, c)
@@ -53,7 +53,7 @@ func TestParseURL(t *testing.T) {
 func TestR2EndpointDerivation(t *testing.T) {
 	c, err := load("origin", "r2://b/p", fakeGit{}, env(map[string]string{
 		"R2_ACCOUNT_ID": "abc123",
-	}))
+	}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestExplicitEndpointWinsAndPathStyleHeuristic(t *testing.T) {
 	c, err := load("origin", "s3://b/p", fakeGit{}, env(map[string]string{
 		"R2_ACCOUNT_ID":    "abc123",
 		"AWS_ENDPOINT_URL": "http://127.0.0.1:9000",
-	}))
+	}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,7 +91,7 @@ func TestGitConfigPrecedence(t *testing.T) {
 		"r2.agerecipients":         {"age1aaa", "age1bbb"},
 		"remote.origin.encryption": {"none"},
 	}
-	c, err := load("origin", "r2://b", git, env(nil))
+	c, err := load("origin", "r2://b", git, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestGitConfigPrecedence(t *testing.T) {
 	}
 
 	// Env beats git config.
-	c, err = load("origin", "r2://b", git, env(map[string]string{"R2_ACCOUNT_ID": "from-env"}))
+	c, err = load("origin", "r2://b", git, env(map[string]string{"R2_ACCOUNT_ID": "from-env"}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,8 +115,52 @@ func TestGitConfigPrecedence(t *testing.T) {
 	}
 }
 
+func TestSavedCredentialsResolution(t *testing.T) {
+	stored := func(account, endpoint string) (string, string, bool) {
+		if account == "acct1" {
+			return "stored-key", "stored-secret", true
+		}
+		return "", "", false
+	}
+
+	// Env is empty → saved credentials fill in.
+	c, err := load("origin", "r2://b", fakeGit{}, env(map[string]string{
+		"R2_ACCOUNT_ID": "acct1",
+	}), stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessKeyID != "stored-key" || c.SecretAccessKey != "stored-secret" {
+		t.Errorf("saved credentials not used: %q/%q", c.AccessKeyID, c.SecretAccessKey)
+	}
+
+	// Env credentials win over the store.
+	c, err = load("origin", "r2://b", fakeGit{}, env(map[string]string{
+		"R2_ACCOUNT_ID":         "acct1",
+		"AWS_ACCESS_KEY_ID":     "env-key",
+		"AWS_SECRET_ACCESS_KEY": "env-secret",
+	}), stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessKeyID != "env-key" {
+		t.Errorf("env should win over the store, got %q", c.AccessKeyID)
+	}
+
+	// No match in the store → left empty for the AWS default chain.
+	c, err = load("origin", "r2://b", fakeGit{}, env(map[string]string{
+		"R2_ACCOUNT_ID": "unknown-acct",
+	}), stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AccessKeyID != "" {
+		t.Errorf("expected empty credentials, got %q", c.AccessKeyID)
+	}
+}
+
 func TestEncryptionDefaultsToAge(t *testing.T) {
-	c, err := load("origin", "r2://b", fakeGit{}, env(nil))
+	c, err := load("origin", "r2://b", fakeGit{}, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +169,7 @@ func TestEncryptionDefaultsToAge(t *testing.T) {
 	}
 	if _, err := load("origin", "r2://b", fakeGit{}, env(map[string]string{
 		"GIT_REMOTE_R2_ENCRYPTION": "rot13",
-	})); err == nil {
+	}), nil); err == nil {
 		t.Error("invalid encryption mode should be rejected")
 	}
 }

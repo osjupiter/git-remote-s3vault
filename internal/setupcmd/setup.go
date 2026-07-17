@@ -5,6 +5,7 @@
 package setupcmd
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -16,8 +17,10 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"golang.org/x/term"
 
 	"github.com/osjupiter/git-remote-r2/internal/config"
+	"github.com/osjupiter/git-remote-r2/internal/credstore"
 	"github.com/osjupiter/git-remote-r2/internal/cryptox"
 	"github.com/osjupiter/git-remote-r2/internal/keyring"
 	"github.com/osjupiter/git-remote-r2/internal/storage"
@@ -148,16 +151,26 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	// 4. Connectivity check + repository key (DEK) initialization.
+	// 4. Credentials, connectivity check, repository key initialization.
 	if !*noVerify {
-		cfg, store, err := connect(ctx, *remote, rawURL)
+		cfg, err := config.Load(*remote, rawURL)
+		if err != nil {
+			return err
+		}
+		reportSavedCredentials(cfg, stdout)
+		if cfg.AccessKeyID == "" && promptCredentials(cfg, stdout) {
+			if cfg, err = config.Load(*remote, rawURL); err != nil {
+				return err
+			}
+		}
+		store, err := storage.New(ctx, cfg)
 		if err == nil {
 			err = checkBucket(ctx, store, cfg, stdout)
 		}
 		if err != nil {
 			fmt.Fprintf(stdout, "✗ connectivity check failed: %v\n", err)
-			fmt.Fprintf(stdout, "  (set credentials via AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY or R2_* and re-run,\n")
-			fmt.Fprintf(stdout, "   or skip this check with --no-verify)\n")
+			fmt.Fprintf(stdout, "  (re-run setup to enter credentials interactively, set AWS_ACCESS_KEY_ID/\n")
+			fmt.Fprintf(stdout, "   AWS_SECRET_ACCESS_KEY or R2_* env vars, or skip this check with --no-verify)\n")
 			return fmt.Errorf("setup incomplete: bucket not reachable")
 		}
 		if *encryption == string(config.EncryptionAge) {
@@ -177,16 +190,63 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-func connect(ctx context.Context, remote, rawURL string) (*config.Config, storage.Storage, error) {
-	cfg, err := config.Load(remote, rawURL)
-	if err != nil {
-		return nil, nil, err
+// reportSavedCredentials tells the user when credentials came from the
+// on-disk store rather than the environment.
+func reportSavedCredentials(cfg *config.Config, stdout io.Writer) {
+	envHasCreds := os.Getenv("R2_ACCESS_KEY_ID") != "" || os.Getenv("AWS_ACCESS_KEY_ID") != ""
+	if envHasCreds || cfg.AccessKeyID == "" {
+		return
 	}
-	store, err := storage.New(ctx, cfg)
-	if err != nil {
-		return nil, nil, err
+	if path, err := credstore.Path(); err == nil {
+		fmt.Fprintf(stdout, "✓ using saved credentials from %s\n", path)
 	}
-	return cfg, store, nil
+}
+
+// promptCredentials interactively collects and stores an access key pair
+// when none could be resolved. Returns true if credentials were saved.
+// Without a terminal it quietly leaves resolution to the AWS default chain.
+func promptCredentials(cfg *config.Config, stdout io.Writer) bool {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintf(stdout, "• no stored S3 credentials; relying on the AWS default chain\n")
+		return false
+	}
+	defer tty.Close()
+
+	credPath, _ := credstore.Path()
+	fmt.Fprintf(tty, "\nNo S3 credentials found (checked the environment and %s).\n", credPath)
+	fmt.Fprintf(tty, "Tip: create an R2 API token scoped to ONLY this bucket (Object Read & Write),\n")
+	fmt.Fprintf(tty, "     so that a leaked key cannot touch anything else.\n\n")
+	fmt.Fprintf(tty, "Access Key ID (leave empty to skip and use the AWS default chain): ")
+
+	line, err := bufio.NewReader(tty).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	keyID := strings.TrimSpace(line)
+	if keyID == "" {
+		return false
+	}
+	fmt.Fprintf(tty, "Secret Access Key: ")
+	secretBytes, err := term.ReadPassword(int(tty.Fd()))
+	fmt.Fprintln(tty)
+	if err != nil {
+		return false
+	}
+	secret := strings.TrimSpace(string(secretBytes))
+	if secret == "" {
+		fmt.Fprintf(tty, "✗ empty secret; skipping\n")
+		return false
+	}
+
+	path, section, err := credstore.Save(cfg.AccountID, cfg.Endpoint,
+		credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret})
+	if err != nil {
+		fmt.Fprintf(tty, "✗ could not save credentials: %v\n", err)
+		return false
+	}
+	fmt.Fprintf(stdout, "✓ credentials saved to %s [%s] — shared by every repo on this account\n", path, section)
+	return true
 }
 
 func checkBucket(ctx context.Context, store storage.Storage, cfg *config.Config, stdout io.Writer) error {

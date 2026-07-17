@@ -41,14 +41,20 @@ generates an age key if you don't have one, registers the remote, writes
 repo-local config, and checks that the bucket is reachable:
 
 ```console
-$ export R2_ACCOUNT_ID=<cloudflare account id>   # R2 API token, S3 compatibility mode
-$ export R2_ACCESS_KEY_ID=<key id>
-$ export R2_SECRET_ACCESS_KEY=<secret>
+$ export R2_ACCOUNT_ID=<cloudflare account id>
 
 $ git-remote-r2 setup r2://my-bucket/my-repo
 ✓ generated this machine's key (age identity): ~/.config/git-remote-r2/identity.txt
 ✓ added remote "origin" → r2://my-bucket/my-repo
 ✓ 1 recipient(s) configured (1 added)
+
+No S3 credentials found (checked the environment and ~/.config/git-remote-r2/credentials).
+Tip: create an R2 API token scoped to ONLY this bucket (Object Read & Write),
+     so that a leaked key cannot touch anything else.
+
+Access Key ID (leave empty to skip and use the AWS default chain): ...
+Secret Access Key:
+✓ credentials saved to ~/.config/git-remote-r2/credentials [account:...] — shared by every repo on this account
 ✓ bucket reachable; remote is empty (first push will initialize it)
 ✓ repository key created; wrapped for 1 public key(s)
 ✓ recovery key created — store this line in a password manager or on paper:
@@ -62,6 +68,11 @@ All set. Next:
 
 $ git push -u origin main
 ```
+
+Setup asks for credentials once per account and remembers them in
+`~/.config/git-remote-r2/credentials` (plaintext, 0600 — the same trust
+model as other credential files); the second repository on the same
+account asks nothing.
 
 Useful flags: `--remote <name>`, `--recipient <age1...>` (repeatable; add
 teammates or CI public keys), `--account-id <id>`, `--endpoint <url>` (for
@@ -154,9 +165,20 @@ git config > global git config**.
 | `r2.ageIdentityFile` | `GIT_REMOTE_R2_AGE_IDENTITY_FILE` | this machine's key (age identity or SSH private key), used to unwrap the repository key |
 | `r2.encryption` | `GIT_REMOTE_R2_ENCRYPTION` | `age` (default) or `none` (explicit opt-out) |
 
-Credentials use the standard AWS chain (`AWS_ACCESS_KEY_ID` /
-`AWS_SECRET_ACCESS_KEY`, shared config files, IAM roles);
-`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are accepted as aliases.
+### Credentials
+
+Resolution order:
+
+1. environment — `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
+   (`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are accepted as aliases)
+2. `~/.config/git-remote-r2/credentials` — written by `setup`, keyed per
+   account (or per endpoint), shared by all repositories on that account
+3. the standard AWS chain (shared config files, IAM roles)
+
+Use **bucket-scoped R2 API tokens** (Object Read & Write on a single
+bucket): a leaked key then can't reach anything but that bucket's
+ciphertext. Never commit credentials into the repository — the working
+tree travels with every clone; this store does not.
 
 ### MinIO / self-hosted S3 example
 

@@ -6,6 +6,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -29,6 +30,8 @@ const bucket = "git-remotes"
 type harness struct {
 	binDir   string
 	endpoint string
+	username string
+	password string
 	s3c      *s3.Client
 	baseEnv  []string
 	identity *age.X25519Identity
@@ -83,7 +86,10 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 
-	h := &harness{binDir: binDir, endpoint: endpoint, s3c: s3c, identity: id}
+	h := &harness{
+		binDir: binDir, endpoint: endpoint, s3c: s3c, identity: id,
+		username: minioC.Username, password: minioC.Password,
+	}
 	h.baseEnv = append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"AWS_ENDPOINT_URL="+endpoint,
@@ -538,6 +544,65 @@ func TestGrantTeamFlow(t *testing.T) {
 	}
 	if out, err := h.git(t, work, bobEnv, "clone", remoteURL, "revoked"); err == nil {
 		t.Fatalf("bob's clone after revoke must fail:\n%s", out)
+	}
+}
+
+// TestSavedCredentialsFlow proves that credentials stored in
+// ~/.config/git-remote-r2/credentials are enough on their own: with no
+// AWS_* / R2_* variables in the environment, setup reports the saved
+// entry and git push / clone authenticate through it.
+func TestSavedCredentialsFlow(t *testing.T) {
+	h := newHarness(t)
+	remoteURL := "r2://" + bucket + "/saved-creds"
+
+	// Seed the credential store, keyed by the MinIO endpoint.
+	cfgHome := t.TempDir()
+	credDir := filepath.Join(cfgHome, "git-remote-r2")
+	if err := os.MkdirAll(credDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credFile := fmt.Sprintf("[endpoint:%s]\naccess_key_id = %s\nsecret_access_key = %s\n",
+		h.endpoint, h.username, h.password)
+	if err := os.WriteFile(filepath.Join(credDir, "credentials"), []byte(credFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Strip every credential variable; only the store remains.
+	env := []string{
+		"AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=",
+		"R2_ACCESS_KEY_ID=", "R2_SECRET_ACCESS_KEY=",
+		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"XDG_CONFIG_HOME=" + cfgHome,
+	}
+
+	repo := t.TempDir()
+	h.mustGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("via saved creds\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "c")
+
+	setup := exec.Command(filepath.Join(h.binDir, "git-remote-r2"), "setup", remoteURL)
+	setup.Dir = repo
+	setup.Env = append(append([]string{}, h.baseEnv...), env...)
+	out, err := setup.CombinedOutput()
+	if err != nil {
+		t.Fatalf("setup with saved credentials: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "using saved credentials") {
+		t.Errorf("setup should report the credential source:\n%s", out)
+	}
+
+	if gout, err := h.git(t, repo, env, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push with saved credentials: %v\n%s", err, gout)
+	}
+	work := t.TempDir()
+	if gout, err := h.git(t, work, env, "clone", "-q", remoteURL, "c"); err != nil {
+		t.Fatalf("clone with saved credentials: %v\n%s", err, gout)
+	}
+	if data, err := os.ReadFile(filepath.Join(work, "c", "f.txt")); err != nil || string(data) != "via saved creds\n" {
+		t.Fatalf("cloned content: %q, %v", data, err)
 	}
 }
 
