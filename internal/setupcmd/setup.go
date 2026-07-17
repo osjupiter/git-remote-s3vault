@@ -1,4 +1,4 @@
-// Package setupcmd implements `git-remote-r2 setup`, a one-shot command
+// Package setupcmd implements `git-remote-s3ee setup`, a one-shot command
 // that wires an existing git repository up to an encrypted R2/S3 remote:
 // it generates an age key if needed, registers the remote, stores all
 // settings in repo-local git config, and checks connectivity.
@@ -20,11 +20,11 @@ import (
 	"filippo.io/age"
 	"golang.org/x/term"
 
-	"github.com/osjupiter/git-remote-r2/internal/config"
-	"github.com/osjupiter/git-remote-r2/internal/credstore"
-	"github.com/osjupiter/git-remote-r2/internal/cryptox"
-	"github.com/osjupiter/git-remote-r2/internal/keyring"
-	"github.com/osjupiter/git-remote-r2/internal/storage"
+	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
+	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
 type stringList []string
@@ -35,19 +35,18 @@ func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 // Run executes the setup command. args are the arguments after "setup";
 // stdin feeds the interactive wizard that starts when no URL is given.
 func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("git-remote-r2 setup", flag.ContinueOnError)
+	fs := flag.NewFlagSet("git-remote-s3ee setup", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	remote := fs.String("remote", "origin", "name of the git remote to create or update")
-	accountID := fs.String("account-id", "", "Cloudflare account ID (stored in repo config)")
 	endpoint := fs.String("endpoint", "", "explicit S3 endpoint URL (MinIO, AWS, ...)")
-	identityPath := fs.String("identity", "", "age identity file (default: ~/.config/git-remote-r2/identity.txt, generated if missing)")
+	identityPath := fs.String("identity", "", "age identity file (default: ~/.config/git-remote-s3ee/identity.txt, generated if missing)")
 	encryption := fs.String("encryption", "age", `encryption mode: "age" (default) or "none"`)
 	noVerify := fs.Bool("no-verify", false, "skip the connectivity check against the bucket")
 	var extraRecipients stringList
 	fs.Var(&extraRecipients, "recipient", "additional age recipient (repeatable): teammate or CI public key")
 
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: git-remote-r2 setup [r2://bucket/prefix] [flags]\n")
+		fmt.Fprintf(stderr, "usage: git-remote-s3ee setup [s3ee://bucket/prefix] [flags]\n")
 		fmt.Fprintf(stderr, "(with no URL, an interactive wizard asks for everything)\n\n")
 		fs.PrintDefaults()
 	}
@@ -79,9 +78,6 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		*remote = answers.remoteName
 		wizKey = answers.key
 		wizCredsSaved = answers.credsSaved
-		if answers.accountID != "" {
-			*accountID = answers.accountID
-		}
 		if answers.endpoint != "" {
 			*endpoint = answers.endpoint
 		}
@@ -148,12 +144,6 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	// 3. Persist settings in repo-local config, scoped to this remote.
 	scope := "remote." + *remote + "."
-	if *accountID != "" {
-		if err := runGit(nil, "config", scope+"accountid", *accountID); err != nil {
-			return err
-		}
-		fmt.Fprintf(stdout, "✓ set account ID (endpoint https://%s.r2.cloudflarestorage.com)\n", *accountID)
-	}
 	if *endpoint != "" {
 		if err := runGit(nil, "config", scope+"endpoint", *endpoint); err != nil {
 			return err
@@ -225,7 +215,7 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	fmt.Fprintf(stdout, "\nAll set. Next:\n")
 	fmt.Fprintf(stdout, "  git push -u %s <branch>\n", *remote)
 	if *encryption == string(config.EncryptionAge) {
-		fmt.Fprintf(stdout, "  # add a teammate: git-remote-r2 key grant <their-age-public-key>\n")
+		fmt.Fprintf(stdout, "  # add a teammate: git-remote-s3ee key grant <their-age-public-key>\n")
 	}
 	return nil
 }
@@ -234,7 +224,6 @@ func Run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 type wizardAnswers struct {
 	rawURL     string
 	remoteName string
-	accountID  string
 	endpoint   string
 	key        *keyCandidate
 	credsSaved bool
@@ -264,7 +253,7 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 	fmt.Fprintf(stdout, "Interactive setup — Enter accepts the [default].\n\n")
 	a := &wizardAnswers{}
 
-	// Re-runs: offer the repository's existing r2:// remote right away.
+	// Re-runs: offer the repository's existing s3ee:// remote right away.
 	if existing, err := gitOutput("remote", "get-url", defaultRemote); err == nil {
 		if config.ValidateURL(existing) == nil {
 			use, err := ask(fmt.Sprintf("Found remote %q → %s — use it?", defaultRemote, existing), "Y")
@@ -284,38 +273,14 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 		}
 	}
 
-	// Backend: default to whichever the environment already hints at.
-	backendDefault := "1"
-	if os.Getenv("R2_ACCOUNT_ID") == "" && os.Getenv("CLOUDFLARE_ACCOUNT_ID") == "" &&
-		(os.Getenv("AWS_ENDPOINT_URL") != "" || os.Getenv("AWS_ENDPOINT_URL_S3") != "") {
-		backendDefault = "2"
-	}
-	fmt.Fprintf(stdout, "Backend:\n  1) Cloudflare R2\n  2) Other S3-compatible storage (MinIO, AWS S3, ...)\n")
-	for {
-		choice, err := ask("Backend", backendDefault)
-		if err != nil {
+	// Any S3-compatible endpoint: R2 is https://<account>.r2.cloudflarestorage.com,
+	// MinIO is your server, empty means AWS S3.
+	{
+		def := firstNonEmptyEnv("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+		var err error
+		if a.endpoint, err = ask("S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3)", def); err != nil {
 			return nil, err
 		}
-		switch choice {
-		case "1":
-			def := firstNonEmptyEnv("R2_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID")
-			if a.accountID, err = ask("Cloudflare account ID", def); err != nil {
-				return nil, err
-			}
-			if a.accountID == "" {
-				fmt.Fprintf(stdout, "An account ID is required for R2.\n")
-				continue
-			}
-		case "2":
-			def := firstNonEmptyEnv("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
-			if a.endpoint, err = ask("Endpoint URL (empty for AWS S3)", def); err != nil {
-				return nil, err
-			}
-		default:
-			fmt.Fprintf(stdout, "Please answer 1 or 2.\n")
-			continue
-		}
-		break
 	}
 
 	// Credentials come right after the backend, before the bucket, so all
@@ -368,7 +333,7 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 		}
 	}
 
-	a.rawURL = "r2://" + bucket
+	a.rawURL = "s3ee://" + bucket
 	if p := strings.Trim(prefix, "/"); p != "" {
 		a.rawURL += "/" + p
 	}
@@ -386,7 +351,7 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 	// Persist credentials only after the confirmation: an aborted wizard
 	// leaves no trace.
 	if creds != nil {
-		path, section, err := credstore.Save(a.accountID, a.endpoint, bucket, *creds)
+		path, section, err := credstore.Save(a.endpoint, bucket, *creds)
 		if err != nil {
 			return nil, err
 		}
@@ -493,7 +458,7 @@ func promptCredentials(cfg *config.Config, stdout io.Writer) bool {
 		return false
 	}
 
-	path, section, err := credstore.Save(cfg.AccountID, cfg.Endpoint, cfg.Bucket,
+	path, section, err := credstore.Save(cfg.Endpoint, cfg.Bucket,
 		credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret})
 	if err != nil {
 		fmt.Fprintf(tty, "✗ could not save credentials: %v\n", err)
@@ -548,7 +513,7 @@ func syncKeyring(ctx context.Context, store storage.Storage, cfg *config.Config,
 		fmt.Fprintf(stdout, "\n    %s\n\n", recovery)
 		fmt.Fprintf(stdout, "  It will NOT be shown again. Anyone holding it can decrypt this repository.\n")
 		fmt.Fprintf(stdout, "  If you ever lose all devices, recover with:\n")
-		fmt.Fprintf(stdout, "    git-remote-r2 key recover %s\n", cfg.RawURL)
+		fmt.Fprintf(stdout, "    git-remote-s3ee key recover %s\n", cfg.RawURL)
 		return nil
 	}
 
@@ -565,7 +530,7 @@ func syncKeyring(ctx context.Context, store storage.Storage, cfg *config.Config,
 		}
 	}
 	if !hasRecovery {
-		fmt.Fprintf(stdout, "• this repository has no recovery key; consider `git-remote-r2 key recovery-init`\n")
+		fmt.Fprintf(stdout, "• this repository has no recovery key; consider `git-remote-s3ee key recovery-init`\n")
 	}
 	var missing []string
 	for _, w := range wanted {
@@ -590,7 +555,7 @@ func syncKeyring(ctx context.Context, store storage.Storage, cfg *config.Config,
 		fmt.Fprintf(stdout, "⚠ repository key exists but this machine's key cannot unwrap it.\n")
 		fmt.Fprintf(stdout, "  Ask an existing member to grant you access:\n")
 		for _, m := range missing {
-			fmt.Fprintf(stdout, "    git-remote-r2 key grant %s %s\n", m, cfg.RawURL)
+			fmt.Fprintf(stdout, "    git-remote-s3ee key grant %s %s\n", m, cfg.RawURL)
 		}
 		return nil
 	}

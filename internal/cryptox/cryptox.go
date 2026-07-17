@@ -125,7 +125,7 @@ func DefaultIdentityPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve user config dir: %w", err)
 	}
-	return filepath.Join(dir, "git-remote-r2", "identity.txt"), nil
+	return filepath.Join(dir, "git-remote-s3ee", "identity.txt"), nil
 }
 
 // AppendNewIdentity generates a fresh X25519 identity and appends it to

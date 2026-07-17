@@ -1,17 +1,17 @@
-// Package credstore is the on-disk store for S3/R2 credentials at
-// ~/.config/git-remote-r2/credentials.
+// Package credstore is the on-disk store for S3 credentials at
+// ~/.config/git-remote-s3ee/credentials.
 //
 // The file is plaintext with 0600 permissions — the same trust model as
 // standard credential files. The expected setup is one bucket-scoped API
 // token per repository, so every entry is keyed by its bucket (qualified
-// by account or endpoint to disambiguate identical bucket names across
-// backends). There are no account-wide entries and no fallback:
+// by endpoint to disambiguate identical bucket names across backends).
+// There are no wide entries and no fallback:
 //
-//	[account:abc123 bucket:my-repo]
+//	[endpoint:https://x.r2.cloudflarestorage.com bucket:my-repo]
 //	access_key_id = ...
 //	secret_access_key = ...
 //
-//	[endpoint:http://127.0.0.1:9000 bucket:test]   # generic S3 backends
+//	[bucket:aws-bucket]   # AWS S3 (no explicit endpoint)
 //	...
 package credstore
 
@@ -34,29 +34,25 @@ func Path() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve user config dir: %w", err)
 	}
-	return filepath.Join(dir, "git-remote-r2", "credentials"), nil
+	return filepath.Join(dir, "git-remote-s3ee", "credentials"), nil
 }
 
-// SectionKey derives the storage key for a bucket, qualified by account
-// or endpoint when one is configured.
-func SectionKey(accountID, endpoint, bucket string) (string, error) {
+// SectionKey derives the storage key for a bucket, qualified by endpoint
+// when one is configured (empty endpoint = AWS S3).
+func SectionKey(endpoint, bucket string) (string, error) {
 	if bucket == "" {
 		return "", fmt.Errorf("a bucket is required (entries are always bucket-scoped)")
 	}
-	switch {
-	case accountID != "":
-		return "account:" + accountID + " bucket:" + bucket, nil
-	case endpoint != "":
+	if endpoint != "" {
 		return "endpoint:" + strings.TrimRight(endpoint, "/") + " bucket:" + bucket, nil
-	default:
-		return "bucket:" + bucket, nil
 	}
+	return "bucket:" + bucket, nil
 }
 
 // Lookup finds the stored credentials for exactly this bucket. There is
 // no fallback; a missing or unreadable file is treated as "no
 // credentials".
-func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
+func Lookup(endpoint, bucket string) (Credentials, bool) {
 	if bucket == "" {
 		return Credentials{}, false
 	}
@@ -68,26 +64,17 @@ func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
 	if err != nil {
 		return Credentials{}, false
 	}
-	ep := strings.TrimRight(endpoint, "/")
-	var keys []string
-	if accountID != "" {
-		keys = append(keys, "account:"+accountID+" bucket:"+bucket)
+	key, err := SectionKey(endpoint, bucket)
+	if err != nil {
+		return Credentials{}, false
 	}
-	if ep != "" {
-		keys = append(keys, "endpoint:"+ep+" bucket:"+bucket)
-	}
-	if accountID == "" && ep == "" {
-		keys = append(keys, "bucket:"+bucket)
-	}
-	for _, k := range keys {
-		if s, ok := sections.get(k); ok {
-			c := Credentials{
-				AccessKeyID:     s.values["access_key_id"],
-				SecretAccessKey: s.values["secret_access_key"],
-			}
-			if c.AccessKeyID != "" && c.SecretAccessKey != "" {
-				return c, true
-			}
+	if s, ok := sections.get(key); ok {
+		c := Credentials{
+			AccessKeyID:     s.values["access_key_id"],
+			SecretAccessKey: s.values["secret_access_key"],
+		}
+		if c.AccessKeyID != "" && c.SecretAccessKey != "" {
+			return c, true
 		}
 	}
 	return Credentials{}, false
@@ -96,11 +83,11 @@ func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
 // Save upserts this bucket's credentials and writes the file with 0600
 // permissions, preserving unrelated entries. It returns the file path and
 // the section name used.
-func Save(accountID, endpoint, bucket string, c Credentials) (string, string, error) {
+func Save(endpoint, bucket string, c Credentials) (string, string, error) {
 	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 		return "", "", fmt.Errorf("both an access key ID and a secret access key are required")
 	}
-	key, err := SectionKey(accountID, endpoint, bucket)
+	key, err := SectionKey(endpoint, bucket)
 	if err != nil {
 		return "", "", err
 	}
@@ -121,7 +108,7 @@ func Save(accountID, endpoint, bucket string, c Credentials) (string, string, er
 		return "", "", err
 	}
 	var b strings.Builder
-	b.WriteString("# git-remote-r2 credentials. Keep permissions at 0600.\n")
+	b.WriteString("# git-remote-s3ee credentials. Keep permissions at 0600.\n")
 	b.WriteString("# Tip: use R2 API tokens scoped to a single bucket (Object Read & Write).\n")
 	for _, s := range sections.list {
 		fmt.Fprintf(&b, "\n[%s]\n", s.name)

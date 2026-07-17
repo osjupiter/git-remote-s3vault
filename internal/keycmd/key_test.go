@@ -11,9 +11,9 @@ import (
 
 	"filippo.io/age"
 
-	"github.com/osjupiter/git-remote-r2/internal/config"
-	"github.com/osjupiter/git-remote-r2/internal/keyring"
-	"github.com/osjupiter/git-remote-r2/internal/storage"
+	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
 var secretRe = regexp.MustCompile(`AGE-SECRET-KEY-1[0-9A-Z]+`)
@@ -64,7 +64,7 @@ func TestGrantListRevokeCLI(t *testing.T) {
 	idPath, _ := initKeyring(t, mem)
 	bob, _ := age.GenerateX25519Identity()
 
-	out, err := run(t, "grant", "--identity", idPath, "--name", "bob", bob.Recipient().String(), "r2://bucket/proj")
+	out, err := run(t, "grant", "--identity", idPath, "--name", "bob", bob.Recipient().String(), "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatalf("grant: %v\n%s", err, out)
 	}
@@ -72,7 +72,7 @@ func TestGrantListRevokeCLI(t *testing.T) {
 		t.Errorf("grant output:\n%s", out)
 	}
 
-	out, err = run(t, "list", "r2://bucket/proj")
+	out, err = run(t, "list", "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatalf("list: %v\n%s", err, out)
 	}
@@ -80,10 +80,10 @@ func TestGrantListRevokeCLI(t *testing.T) {
 		t.Errorf("list output:\n%s", out)
 	}
 
-	if out, err = run(t, "revoke", "bob", "r2://bucket/proj"); err != nil {
+	if out, err = run(t, "revoke", "bob", "s3ee://bucket/proj"); err != nil {
 		t.Fatalf("revoke: %v\n%s", err, out)
 	}
-	out, _ = run(t, "list", "r2://bucket/proj")
+	out, _ = run(t, "list", "s3ee://bucket/proj")
 	if !strings.Contains(out, "1 key slot(s)") {
 		t.Errorf("bob's slot should be gone:\n%s", out)
 	}
@@ -95,7 +95,7 @@ func TestGrantRequiresAccess(t *testing.T) {
 	strangerPath, _ := writeIdentity(t) // not granted
 	bob, _ := age.GenerateX25519Identity()
 
-	out, err := run(t, "grant", "--identity", strangerPath, bob.Recipient().String(), "r2://bucket/proj")
+	out, err := run(t, "grant", "--identity", strangerPath, bob.Recipient().String(), "s3ee://bucket/proj")
 	if err == nil {
 		t.Fatalf("a stranger must not be able to grant:\n%s", out)
 	}
@@ -108,7 +108,7 @@ func TestRecoveryInitAndRecover(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
 
-	out, err := run(t, "recovery-init", "--identity", idPath, "r2://bucket/proj")
+	out, err := run(t, "recovery-init", "--identity", idPath, "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatalf("recovery-init: %v\n%s", err, out)
 	}
@@ -123,9 +123,9 @@ func TestRecoveryInitAndRecover(t *testing.T) {
 	}
 
 	// New machine: only the secret survives.
-	t.Setenv("GIT_REMOTE_R2_RECOVERY_KEY", secret)
+	t.Setenv("GIT_REMOTE_S3EE_RECOVERY_KEY", secret)
 	newIDPath := filepath.Join(t.TempDir(), "new-machine.txt")
-	out, err = run(t, "recover", "--identity", newIDPath, "r2://bucket/proj")
+	out, err = run(t, "recover", "--identity", newIDPath, "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatalf("recover: %v\n%s", err, out)
 	}
@@ -148,19 +148,19 @@ func TestRecoveryInitAndRecover(t *testing.T) {
 func TestRecoverWithWrongKeyFails(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
-	if _, err := run(t, "recovery-init", "--identity", idPath, "r2://bucket/proj"); err != nil {
+	if _, err := run(t, "recovery-init", "--identity", idPath, "s3ee://bucket/proj"); err != nil {
 		t.Fatal(err)
 	}
 
 	wrong, _ := age.GenerateX25519Identity()
-	t.Setenv("GIT_REMOTE_R2_RECOVERY_KEY", wrong.String())
-	out, err := run(t, "recover", "--identity", filepath.Join(t.TempDir(), "x.txt"), "r2://bucket/proj")
+	t.Setenv("GIT_REMOTE_S3EE_RECOVERY_KEY", wrong.String())
+	out, err := run(t, "recover", "--identity", filepath.Join(t.TempDir(), "x.txt"), "s3ee://bucket/proj")
 	if err == nil {
 		t.Fatalf("recover with a wrong key must fail:\n%s", out)
 	}
 
-	t.Setenv("GIT_REMOTE_R2_RECOVERY_KEY", "not-a-key-at-all")
-	if out, err := run(t, "recover", "r2://bucket/proj"); err == nil {
+	t.Setenv("GIT_REMOTE_S3EE_RECOVERY_KEY", "not-a-key-at-all")
+	if out, err := run(t, "recover", "s3ee://bucket/proj"); err == nil {
 		t.Fatalf("garbage recovery key must fail:\n%s", out)
 	}
 }
@@ -169,11 +169,11 @@ func TestRecoveryInitReplacesOldSecret(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
 
-	out1, err := run(t, "recovery-init", "--identity", idPath, "r2://bucket/proj")
+	out1, err := run(t, "recovery-init", "--identity", idPath, "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatal(err)
 	}
-	out2, err := run(t, "recovery-init", "--identity", idPath, "r2://bucket/proj")
+	out2, err := run(t, "recovery-init", "--identity", idPath, "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,12 +183,12 @@ func TestRecoveryInitReplacesOldSecret(t *testing.T) {
 	}
 
 	// The old secret is dead, the new one works.
-	t.Setenv("GIT_REMOTE_R2_RECOVERY_KEY", oldSecret)
-	if _, err := run(t, "recover", "--identity", filepath.Join(t.TempDir(), "a.txt"), "r2://bucket/proj"); err == nil {
+	t.Setenv("GIT_REMOTE_S3EE_RECOVERY_KEY", oldSecret)
+	if _, err := run(t, "recover", "--identity", filepath.Join(t.TempDir(), "a.txt"), "s3ee://bucket/proj"); err == nil {
 		t.Fatal("old recovery secret must be invalid after re-init")
 	}
-	t.Setenv("GIT_REMOTE_R2_RECOVERY_KEY", newSecret)
-	if out, err := run(t, "recover", "--identity", filepath.Join(t.TempDir(), "b.txt"), "r2://bucket/proj"); err != nil {
+	t.Setenv("GIT_REMOTE_S3EE_RECOVERY_KEY", newSecret)
+	if out, err := run(t, "recover", "--identity", filepath.Join(t.TempDir(), "b.txt"), "s3ee://bucket/proj"); err != nil {
 		t.Fatalf("new recovery secret should work: %v\n%s", err, out)
 	}
 }

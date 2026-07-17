@@ -2,7 +2,7 @@
 // remote URL, git configuration, and environment variables.
 //
 // Precedence (highest first): environment variables, remote-scoped git
-// config (remote.<name>.*), global git config (r2.*), built-in defaults.
+// config (remote.<name>.*), global git config (s3ee.*), built-in defaults.
 package config
 
 import (
@@ -12,16 +12,18 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/osjupiter/git-remote-r2/internal/credstore"
+	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
 )
 
-// EncryptionMode selects how bundles are protected before upload.
+// EncryptionMode selects how repository data is protected.
 type EncryptionMode string
 
 const (
-	// EncryptionAge encrypts bundles with age before upload (default).
+	// EncryptionAge is the default: full encryption, with age-based key
+	// management.
 	EncryptionAge EncryptionMode = "age"
-	// EncryptionNone uploads plaintext bundles. Must be opted into explicitly.
+	// EncryptionNone stores data readable by anyone with bucket access.
+	// Must be opted into explicitly.
 	EncryptionNone EncryptionMode = "none"
 )
 
@@ -33,13 +35,12 @@ type Config struct {
 	Bucket string
 	Prefix string // key prefix inside the bucket, no leading/trailing slash
 
-	// Backend endpoint resolution.
-	AccountID    string // Cloudflare account ID; derives the R2 endpoint
-	Endpoint     string // explicit endpoint URL; wins over AccountID
+	// Backend: any S3-compatible endpoint. Empty means AWS S3.
+	Endpoint     string
 	Region       string
 	UsePathStyle bool
 
-	// Static credentials override (falls back to the AWS default chain).
+	// Credentials (env or the credential store; nothing else is consulted).
 	AccessKeyID     string
 	SecretAccessKey string
 	SessionToken    string
@@ -83,16 +84,16 @@ func (execGit) GetAll(key string) []string {
 	return vals
 }
 
-// CredentialLookup finds stored credentials for a bucket, account ID, or
-// endpoint. It exists as an injection point so the config package stays
-// decoupled from the on-disk store (and testable without the filesystem).
-type CredentialLookup func(accountID, endpoint, bucket string) (keyID, secret string, ok bool)
+// CredentialLookup finds stored credentials for an endpoint/bucket pair.
+// It exists as an injection point so the config package stays decoupled
+// from the on-disk store (and testable without the filesystem).
+type CredentialLookup func(endpoint, bucket string) (keyID, secret string, ok bool)
 
 // Load resolves the full configuration for a remote, including saved
-// credentials from ~/.config/git-remote-r2/credentials.
+// credentials from ~/.config/git-remote-s3ee/credentials.
 func Load(remoteName, rawURL string) (*Config, error) {
-	return load(remoteName, rawURL, execGit{}, os.Getenv, func(account, endpoint, bucket string) (string, string, bool) {
-		c, ok := credstore.Lookup(account, endpoint, bucket)
+	return load(remoteName, rawURL, execGit{}, os.Getenv, func(endpoint, bucket string) (string, string, bool) {
+		c, ok := credstore.Lookup(endpoint, bucket)
 		return c.AccessKeyID, c.SecretAccessKey, ok
 	})
 }
@@ -105,7 +106,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 	}
 
 	// lookup returns the first non-empty value among env names, then
-	// remote-scoped git config, then global r2.* git config.
+	// remote-scoped git config, then global s3ee.* git config.
 	lookup := func(gitKey string, envNames ...string) string {
 		for _, e := range envNames {
 			if v := getenv(e); v != "" {
@@ -117,7 +118,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 				return v
 			}
 		}
-		if v, ok := git.Get("r2." + gitKey); ok && v != "" {
+		if v, ok := git.Get("s3ee." + gitKey); ok && v != "" {
 			return v
 		}
 		return ""
@@ -137,51 +138,41 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 				return vs
 			}
 		}
-		return git.GetAll("r2." + gitKey)
+		return git.GetAll("s3ee." + gitKey)
 	}
 
-	c.AccountID = lookup("accountid", "GIT_REMOTE_R2_ACCOUNT_ID", "R2_ACCOUNT_ID", "CLOUDFLARE_ACCOUNT_ID", "CF_ACCOUNT_ID")
-	c.Endpoint = lookup("endpoint", "GIT_REMOTE_R2_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
-	c.Region = lookup("region", "GIT_REMOTE_R2_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")
+	c.Endpoint = lookup("endpoint", "GIT_REMOTE_S3EE_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+	c.Region = lookup("region", "GIT_REMOTE_S3EE_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")
+	if c.Region == "" {
+		c.Region = "us-east-1"
+	}
 
-	// R2's S3-compatibility API takes AWS-shaped credentials, so the
-	// standard variable names are the only ones — no R2_* aliases.
 	c.AccessKeyID = getenv("AWS_ACCESS_KEY_ID")
 	c.SecretAccessKey = getenv("AWS_SECRET_ACCESS_KEY")
 	c.SessionToken = getenv("AWS_SESSION_TOKEN")
-
-	if c.Endpoint == "" && c.AccountID != "" {
-		c.Endpoint = fmt.Sprintf("https://%s.r2.cloudflarestorage.com", c.AccountID)
-	}
-	// Saved credentials fill the gap between env vars (which win) and the
-	// AWS default chain (which storage falls back to when these are empty).
+	// Saved credentials fill in when env vars (which win) are absent.
 	if c.AccessKeyID == "" && creds != nil {
-		if id, secret, ok := creds(c.AccountID, c.Endpoint, c.Bucket); ok {
+		if id, secret, ok := creds(c.Endpoint, c.Bucket); ok {
 			c.AccessKeyID, c.SecretAccessKey = id, secret
 		}
 	}
-	if c.Region == "" {
-		if c.isR2() {
-			c.Region = "auto"
-		} else {
-			c.Region = "us-east-1"
-		}
-	}
 
-	switch v := lookup("usepathstyle", "GIT_REMOTE_R2_PATH_STYLE"); v {
+	switch v := lookup("usepathstyle", "GIT_REMOTE_S3EE_PATH_STYLE"); v {
 	case "true", "1", "yes", "on":
 		c.UsePathStyle = true
 	case "false", "0", "no", "off":
 		c.UsePathStyle = false
 	case "":
 		// Path-style is required by MinIO and most self-hosted S3
-		// implementations; virtual-hosted style is the norm for R2 and AWS.
-		c.UsePathStyle = c.Endpoint != "" && !c.isR2() && !strings.Contains(c.Endpoint, "amazonaws.com")
+		// implementations; virtual-hosted style is the norm for AWS and R2.
+		c.UsePathStyle = c.Endpoint != "" &&
+			!strings.Contains(c.Endpoint, "amazonaws.com") &&
+			!strings.Contains(c.Endpoint, ".r2.cloudflarestorage.com")
 	default:
 		return nil, fmt.Errorf("invalid usepathstyle value %q", v)
 	}
 
-	switch v := lookup("encryption", "GIT_REMOTE_R2_ENCRYPTION"); v {
+	switch v := lookup("encryption", "GIT_REMOTE_S3EE_ENCRYPTION"); v {
 	case "", "age":
 		c.Encryption = EncryptionAge
 	case "none":
@@ -190,9 +181,9 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 		return nil, fmt.Errorf("invalid encryption mode %q (want \"age\" or \"none\")", v)
 	}
 
-	c.Recipients = lookupAll("agerecipients", "GIT_REMOTE_R2_AGE_RECIPIENTS")
-	c.RecipientFiles = lookupAll("agerecipientsfile", "GIT_REMOTE_R2_AGE_RECIPIENTS_FILE")
-	c.IdentityFiles = lookupAll("ageidentityfile", "GIT_REMOTE_R2_AGE_IDENTITY_FILE")
+	c.Recipients = lookupAll("agerecipients", "GIT_REMOTE_S3EE_AGE_RECIPIENTS")
+	c.RecipientFiles = lookupAll("agerecipientsfile", "GIT_REMOTE_S3EE_AGE_RECIPIENTS_FILE")
+	c.IdentityFiles = lookupAll("ageidentityfile", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE")
 
 	return c, nil
 }
@@ -203,16 +194,17 @@ func ValidateURL(raw string) error {
 	return c.parseURL(raw)
 }
 
-// parseURL accepts r2://bucket/prefix and s3://bucket/prefix.
+// parseURL accepts s3ee://bucket/prefix (and s3://bucket/prefix for
+// installations that symlink the binary as git-remote-s3).
 func (c *Config) parseURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return fmt.Errorf("invalid remote URL %q: %w", raw, err)
 	}
 	switch u.Scheme {
-	case "r2", "s3":
+	case "s3ee", "s3":
 	default:
-		return fmt.Errorf("unsupported URL scheme %q (want r2:// or s3://)", u.Scheme)
+		return fmt.Errorf("unsupported URL scheme %q (want s3ee:// or s3://)", u.Scheme)
 	}
 	if u.Host == "" {
 		return fmt.Errorf("remote URL %q is missing a bucket name", raw)
@@ -220,17 +212,4 @@ func (c *Config) parseURL(raw string) error {
 	c.Bucket = u.Host
 	c.Prefix = strings.Trim(u.Path, "/")
 	return nil
-}
-
-func (c *Config) isR2() bool {
-	return strings.Contains(c.Endpoint, ".r2.cloudflarestorage.com")
-}
-
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }

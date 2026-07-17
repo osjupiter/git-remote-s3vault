@@ -16,7 +16,7 @@ import (
 	"filippo.io/age"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/osjupiter/git-remote-r2/internal/credstore"
+	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
 )
 
 func gitOut(t *testing.T, args ...string) (string, error) {
@@ -53,12 +53,12 @@ func runWithInput(t *testing.T, input string, args ...string) (string, error) {
 
 func TestSetupFreshRepo(t *testing.T) {
 	setupRepo(t)
-	out, err := run(t, "--no-verify", "r2://bucket/proj")
+	out, err := run(t, "--no-verify", "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatalf("setup failed: %v\n%s", err, out)
 	}
 
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://bucket/proj" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://bucket/proj" {
 		t.Errorf("remote url = %q", url)
 	}
 	recips, _ := gitOut(t, "config", "--get-all", "remote.origin.agerecipients")
@@ -67,7 +67,7 @@ func TestSetupFreshRepo(t *testing.T) {
 	}
 
 	// A fresh identity was generated at the default location with 0600.
-	idPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-r2", "identity.txt")
+	idPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-s3ee", "identity.txt")
 	st, err := os.Stat(idPath)
 	if err != nil {
 		t.Fatalf("identity not generated: %v", err)
@@ -82,11 +82,11 @@ func TestSetupFreshRepo(t *testing.T) {
 
 func TestSetupIsIdempotent(t *testing.T) {
 	setupRepo(t)
-	if _, err := run(t, "--no-verify", "r2://bucket/proj"); err != nil {
+	if _, err := run(t, "--no-verify", "s3ee://bucket/proj"); err != nil {
 		t.Fatal(err)
 	}
 	out, err := run(t, "--no-verify", "--recipient",
-		"age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p", "r2://bucket/proj")
+		"age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p", "s3ee://bucket/proj")
 	if err != nil {
 		t.Fatalf("second setup failed: %v\n%s", err, out)
 	}
@@ -108,21 +108,21 @@ func TestSetupIsIdempotent(t *testing.T) {
 func TestSetupUpdatesExistingRemote(t *testing.T) {
 	setupRepo(t)
 	gitOut(t, "remote", "add", "origin", "https://example.com/old.git")
-	out, err := run(t, "--no-verify", "--account-id", "acct42", "r2://bucket/new-home")
+	out, err := run(t, "--no-verify", "--endpoint", "https://ep.example.com", "s3ee://bucket/new-home")
 	if err != nil {
 		t.Fatalf("setup failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://bucket/new-home" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://bucket/new-home" {
 		t.Errorf("remote url not updated: %q", url)
 	}
-	if v, _ := gitOut(t, "config", "remote.origin.accountid"); v != "acct42" {
-		t.Errorf("accountid = %q", v)
+	if v, _ := gitOut(t, "config", "remote.origin.endpoint"); v != "https://ep.example.com" {
+		t.Errorf("endpoint = %q", v)
 	}
 }
 
 func TestSetupEncryptionNone(t *testing.T) {
 	setupRepo(t)
-	out, err := run(t, "--no-verify", "--encryption", "none", "r2://bucket/plain")
+	out, err := run(t, "--no-verify", "--encryption", "none", "s3ee://bucket/plain")
 	if err != nil {
 		t.Fatalf("setup failed: %v\n%s", err, out)
 	}
@@ -139,19 +139,18 @@ func TestSetupEncryptionNone(t *testing.T) {
 
 func TestWizardBuildsURLFromAnswers(t *testing.T) {
 	setupRepo(t)
-	// Backend 1 (R2), account, bucket, default prefix (repo dir name),
-	// default remote name.
+	// Endpoint, credentials skipped, bucket, prefix, default remote name.
 	out, err := runWithInput(t,
-		"1\nacct42\n\nmy-bucket\nmy-prefix\n\n\n",
+		"https://ep.example.com\n\nmy-bucket\nmy-prefix\n\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://my-bucket/my-prefix" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://my-bucket/my-prefix" {
 		t.Errorf("remote url = %q", url)
 	}
-	if v, _ := gitOut(t, "config", "remote.origin.accountid"); v != "acct42" {
-		t.Errorf("accountid = %q", v)
+	if v, _ := gitOut(t, "config", "remote.origin.endpoint"); v != "https://ep.example.com" {
+		t.Errorf("endpoint = %q", v)
 	}
 }
 
@@ -165,7 +164,7 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 	// Enter accepts backend=2 (env-derived) and the endpoint default; the
 	// prefix default is the repository directory name.
 	out, err := runWithInput(t,
-		"\n\nbkt\n\nupstream\n\n",
+		"\nbkt\n\nupstream\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
@@ -174,7 +173,7 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 		t.Errorf("credential questions should be skipped with env creds:\n%s", out)
 	}
 	top, _ := gitOut(t, "rev-parse", "--show-toplevel")
-	wantURL := "r2://bkt/" + filepath.Base(top)
+	wantURL := "s3ee://bkt/" + filepath.Base(top)
 	if url, _ := gitOut(t, "remote", "get-url", "upstream"); url != wantURL {
 		t.Errorf("remote url = %q, want %q", url, wantURL)
 	}
@@ -185,26 +184,26 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 
 func TestWizardReusesExistingRemote(t *testing.T) {
 	setupRepo(t)
-	gitOut(t, "remote", "add", "origin", "r2://old-bucket/old-prefix")
+	gitOut(t, "remote", "add", "origin", "s3ee://old-bucket/old-prefix")
 	out, err := runWithInput(t, "\n", "--no-verify") // Enter = "Y", use it
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://old-bucket/old-prefix" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://old-bucket/old-prefix" {
 		t.Errorf("remote url = %q", url)
 	}
 }
 
 func TestWizardCollectsCredentialsBeforeBucket(t *testing.T) {
 	setupRepo(t)
-	// Backend, account, THEN access key + secret, THEN bucket etc.
+	// Endpoint, THEN access key + secret, THEN bucket etc.
 	out, err := runWithInput(t,
-		"1\nacct42\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\n\n",
+		"https://ep.example.com\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
 	}
-	c, ok := credstore.Lookup("acct42", "", "my-bucket")
+	c, ok := credstore.Lookup("https://ep.example.com", "my-bucket")
 	if !ok || c.AccessKeyID != "AKIA123" || c.SecretAccessKey != "topsecret" {
 		t.Fatalf("credentials not saved for the chosen bucket: %+v, %v", c, ok)
 	}
@@ -216,12 +215,12 @@ func TestWizardCollectsCredentialsBeforeBucket(t *testing.T) {
 func TestWizardAbortDiscardsEnteredCredentials(t *testing.T) {
 	setupRepo(t)
 	out, err := runWithInput(t,
-		"1\nacct42\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\nn\n", // decline at confirm
+		"https://ep.example.com\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\nn\n", // decline at confirm
 		"--no-verify")
 	if err == nil {
 		t.Fatalf("declined confirmation must abort:\n%s", out)
 	}
-	if _, ok := credstore.Lookup("acct42", "", "my-bucket"); ok {
+	if _, ok := credstore.Lookup("https://ep.example.com", "my-bucket"); ok {
 		t.Fatal("aborting the wizard must not persist credentials")
 	}
 }
@@ -229,7 +228,7 @@ func TestWizardAbortDiscardsEnteredCredentials(t *testing.T) {
 func TestWizardConfirmationAbortsCleanly(t *testing.T) {
 	setupRepo(t)
 	out, err := runWithInput(t,
-		"1\nacct42\n\nmy-bucket\nmy-prefix\n\nn\n", // "n" at the final confirmation
+		"\n\nmy-bucket\nmy-prefix\n\nn\n", // "n" at the final confirmation
 		"--no-verify")
 	if err == nil {
 		t.Fatalf("declined confirmation must abort:\n%s", out)
@@ -246,12 +245,12 @@ func TestWizardStripsPasteArtifacts(t *testing.T) {
 	// would have been — here the sanitized empty-ish answer falls back to
 	// the default instead.
 	out, err := runWithInput(t,
-		"1\nacct42\n\n\x1b[200~my-bucket\x1b[201~\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
+		"\n\n\x1b[200~my-bucket\x1b[201~\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "r2://my-bucket/my-prefix" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://my-bucket/my-prefix" {
 		t.Errorf("paste artifacts leaked into the config: url=%q", url)
 	}
 }
@@ -270,7 +269,7 @@ func seedMachineKeys(t *testing.T) []string {
 		recips = append(recips, id.Recipient().String())
 		fmt.Fprintf(&content, "%s\n", id)
 	}
-	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-r2")
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-s3ee")
 	os.MkdirAll(dir, 0o700)
 	if err := os.WriteFile(filepath.Join(dir, "identity.txt"), []byte(content.String()), 0o600); err != nil {
 		t.Fatal(err)
@@ -318,7 +317,7 @@ func TestWizardKeySelectionPicksSpecificAgeKey(t *testing.T) {
 
 	// Candidates: 1,2 = age keys, 3 = generate. Pick the second age key.
 	out, err := runWithInput(t,
-		"1\nacct\n\nbkt\npfx\n\n2\n\n",
+		"\n\nbkt\npfx\n\n2\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -336,7 +335,7 @@ func TestWizardKeySelectionSSH(t *testing.T) {
 
 	// Candidates: 1,2 age; 3 SSH; 4 generate. Pick the SSH key.
 	out, err := runWithInput(t,
-		"1\nacct\n\nbkt\npfx\n\n3\n\n",
+		"\n\nbkt\npfx\n\n3\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -356,7 +355,7 @@ func TestWizardSkipsPassphraseProtectedSSHKeys(t *testing.T) {
 
 	// Locked key is not offered: candidates are 2 age keys + generate.
 	out, err := runWithInput(t,
-		"1\nacct\n\nbkt\npfx\n\n1\n\n",
+		"\n\nbkt\npfx\n\n1\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -388,17 +387,17 @@ func TestCloneRejectsBadInput(t *testing.T) {
 	if err := runClone("https://github.com/x/y.git"); err == nil {
 		t.Error("clone with a non-r2 URL must fail")
 	}
-	if err := runClone("r2://b/p", "dir", "extra"); err == nil {
+	if err := runClone("s3ee://b/p", "dir", "extra"); err == nil {
 		t.Error("clone with too many args must fail")
 	}
 }
 
 func TestDeriveCloneDir(t *testing.T) {
 	cases := map[string]string{
-		"r2://bucket/team/project": "project",
-		"r2://bucket/repo.git":     "repo",
-		"r2://bucket":              "bucket",
-		"r2://bucket/":             "bucket",
+		"s3ee://bucket/team/project": "project",
+		"s3ee://bucket/repo.git":     "repo",
+		"s3ee://bucket":              "bucket",
+		"s3ee://bucket/":             "bucket",
 	}
 	for url, want := range cases {
 		if got := deriveCloneDir(url); got != want {
@@ -415,13 +414,13 @@ func TestSetupRejectsBadInput(t *testing.T) {
 	if _, err := run(t, "--no-verify"); err == nil {
 		t.Error("missing URL should be rejected")
 	}
-	if _, err := run(t, "--no-verify", "--encryption", "rot13", "r2://b/p"); err == nil {
+	if _, err := run(t, "--no-verify", "--encryption", "rot13", "s3ee://b/p"); err == nil {
 		t.Error("bad encryption mode should be rejected")
 	}
 
 	// Outside a git repository.
 	t.Chdir(t.TempDir())
-	if _, err := run(t, "--no-verify", "r2://bucket/proj"); err == nil {
+	if _, err := run(t, "--no-verify", "s3ee://bucket/proj"); err == nil {
 		t.Error("setup outside a git repo should fail")
 	}
 }

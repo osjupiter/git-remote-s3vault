@@ -8,7 +8,7 @@ import (
 
 	"filippo.io/age"
 
-	"github.com/osjupiter/git-remote-r2/internal/storage"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
 func newIdentity(t *testing.T) *age.X25519Identity {

@@ -1,10 +1,10 @@
-// Package keycmd implements `git-remote-r2 key ...`: access management for
+// Package keycmd implements `git-remote-s3ee key ...`: access management for
 // the repository's envelope encryption.
 //
 //	grant / list / revoke   manage who can unwrap the repository key (DEK)
 //	recovery-init           (re)create the recovery key slot
 //	recover                 regain access on a fresh machine using only the
-//	                        recovery secret and the r2:// URL
+//	                        recovery secret and the s3ee:// URL
 //
 // The recovery key is asymmetric on purpose: its public half lives in the
 // bucket (.keys/dek/recovery.pub), so future DEK rotations can re-wrap for
@@ -24,10 +24,10 @@ import (
 	"filippo.io/age"
 	"golang.org/x/term"
 
-	"github.com/osjupiter/git-remote-r2/internal/config"
-	"github.com/osjupiter/git-remote-r2/internal/cryptox"
-	"github.com/osjupiter/git-remote-r2/internal/keyring"
-	"github.com/osjupiter/git-remote-r2/internal/storage"
+	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
 // newStore is swapped out by tests to avoid a real S3 client.
@@ -38,12 +38,12 @@ var newStore = func(ctx context.Context, cfg *config.Config) (storage.Storage, e
 // Run executes `key <grant|list|revoke|recovery-init|recover> [args] [flags]`.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	usage := func() {
-		fmt.Fprintln(stderr, "usage: git-remote-r2 key grant   <pubkey> [r2://...] [flags]   give another key access to the repo")
-		fmt.Fprintln(stderr, "       git-remote-r2 key list    [r2://bucket/prefix]          show who has access")
-		fmt.Fprintln(stderr, "       git-remote-r2 key revoke  <label|pubkey> [r2://...]     remove a key's access slot")
-		fmt.Fprintln(stderr, "       git-remote-r2 key recovery-init [r2://...] [flags]      (re)create the recovery key")
-		fmt.Fprintln(stderr, "       git-remote-r2 key recover [r2://bucket/prefix] [flags]  regain access with the recovery secret")
-		fmt.Fprintln(stderr, "The URL may be omitted inside a repository that already has an r2:// remote.")
+		fmt.Fprintln(stderr, "usage: git-remote-s3ee key grant   <pubkey> [s3ee://...] [flags]   give another key access to the repo")
+		fmt.Fprintln(stderr, "       git-remote-s3ee key list    [s3ee://bucket/prefix]          show who has access")
+		fmt.Fprintln(stderr, "       git-remote-s3ee key revoke  <label|pubkey> [s3ee://...]     remove a key's access slot")
+		fmt.Fprintln(stderr, "       git-remote-s3ee key recovery-init [s3ee://...] [flags]      (re)create the recovery key")
+		fmt.Fprintln(stderr, "       git-remote-s3ee key recover [s3ee://bucket/prefix] [flags]  regain access with the recovery secret")
+		fmt.Fprintln(stderr, "The URL may be omitted inside a repository that already has an s3ee:// remote.")
 	}
 	if len(args) == 0 {
 		usage()
@@ -57,11 +57,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("unknown subcommand %q", sub)
 	}
 
-	fs := flag.NewFlagSet("git-remote-r2 key "+sub, flag.ContinueOnError)
+	fs := flag.NewFlagSet("git-remote-s3ee key "+sub, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	remote := fs.String("remote", "origin", "git remote to resolve the URL from when no URL argument is given")
 	name := fs.String("name", "", "grant: slot label for the new key (default: fingerprint of the public key)")
-	identityFlag := fs.String("identity", "", "identity file to use; default: configured or ~/.config/git-remote-r2/identity.txt")
+	identityFlag := fs.String("identity", "", "identity file to use; default: configured or ~/.config/git-remote-s3ee/identity.txt")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -88,7 +88,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		var err error
 		rawURL, err = remoteURL(*remote)
 		if err != nil {
-			return fmt.Errorf("no URL given and none found on remote %q (outside a repo, pass the r2:// URL explicitly): %w", *remote, err)
+			return fmt.Errorf("no URL given and none found on remote %q (outside a repo, pass the s3ee:// URL explicitly): %w", *remote, err)
 		}
 	}
 	if err := config.ValidateURL(rawURL); err != nil {
@@ -148,7 +148,7 @@ func unwrapDEK(ctx context.Context, store storage.Storage, cfg *config.Config, i
 				}
 			}
 		}
-		return nil, fmt.Errorf("this machine's key (%s) cannot unwrap the repository key; ask a member to run `git-remote-r2 key grant <your-public-key>`", idPath)
+		return nil, fmt.Errorf("this machine's key (%s) cannot unwrap the repository key; ask a member to run `git-remote-s3ee key grant <your-public-key>`", idPath)
 	}
 	return dek, nil
 }
@@ -207,7 +207,7 @@ func revoke(ctx context.Context, store storage.Storage, cfg *config.Config, targ
 	fmt.Fprintf(stdout, "⚠ anyone who already unwrapped the repository key can still decrypt existing\n")
 	fmt.Fprintf(stdout, "  data; for a hard cut-off, rotate the key and force-push (key rotation TBD).\n")
 	if slot.Label == keyring.RecoveryLabel {
-		fmt.Fprintf(stdout, "⚠ you removed the RECOVERY slot; run `git-remote-r2 key recovery-init` to create a new one.\n")
+		fmt.Fprintf(stdout, "⚠ you removed the RECOVERY slot; run `git-remote-s3ee key recovery-init` to create a new one.\n")
 	}
 	return nil
 }
@@ -230,7 +230,7 @@ func recoveryInit(ctx context.Context, store storage.Storage, cfg *config.Config
 	fmt.Fprintf(stdout, "✓ recovery key created — store this line in a password manager or on paper:\n")
 	fmt.Fprintf(stdout, "\n    %s\n\n", recovery)
 	fmt.Fprintf(stdout, "  It will NOT be shown again, and it replaces any previous recovery key.\n")
-	fmt.Fprintf(stdout, "  Recover from any machine with:\n    git-remote-r2 key recover %s\n", rawURL)
+	fmt.Fprintf(stdout, "  Recover from any machine with:\n    git-remote-s3ee key recover %s\n", rawURL)
 	return nil
 }
 
@@ -296,12 +296,12 @@ func identityPath(flagValue string, cfg *config.Config) (string, error) {
 // readRecoverySecret takes the recovery key from the environment (for
 // non-interactive use) or prompts on the controlling terminal (echo off).
 func readRecoverySecret() (string, error) {
-	if v := os.Getenv("GIT_REMOTE_R2_RECOVERY_KEY"); v != "" {
+	if v := os.Getenv("GIT_REMOTE_S3EE_RECOVERY_KEY"); v != "" {
 		return v, nil
 	}
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
-		return "", fmt.Errorf("no terminal available for the recovery key prompt; set GIT_REMOTE_R2_RECOVERY_KEY")
+		return "", fmt.Errorf("no terminal available for the recovery key prompt; set GIT_REMOTE_S3EE_RECOVERY_KEY")
 	}
 	defer tty.Close()
 	fmt.Fprint(tty, "recovery key (AGE-SECRET-KEY-...): ")

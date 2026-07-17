@@ -1,4 +1,4 @@
-// Package e2e exercises the compiled git-remote-r2 binary end-to-end
+// Package e2e exercises the compiled git-remote-s3ee binary end-to-end
 // against a real S3-compatible backend (MinIO in a testcontainer), driving
 // it exactly the way users do: through git push / clone / pull.
 package e2e
@@ -45,7 +45,7 @@ func newHarness(t *testing.T) *harness {
 
 	// Compile the helper binary that git will discover on PATH.
 	binDir := t.TempDir()
-	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "git-remote-r2"), "../cmd/git-remote-r2")
+	build := exec.Command("go", "build", "-o", filepath.Join(binDir, "git-remote-s3ee"), "../cmd/git-remote-s3ee")
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building helper: %v\n%s", err, out)
 	}
@@ -96,8 +96,8 @@ func newHarness(t *testing.T) *harness {
 		"AWS_ENDPOINT_URL="+endpoint,
 		"AWS_ACCESS_KEY_ID="+minioC.Username,
 		"AWS_SECRET_ACCESS_KEY="+minioC.Password,
-		"GIT_REMOTE_R2_AGE_RECIPIENTS="+id.Recipient().String(),
-		"GIT_REMOTE_R2_AGE_IDENTITY_FILE="+idFile,
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS="+id.Recipient().String(),
+		"GIT_REMOTE_S3EE_AGE_IDENTITY_FILE="+idFile,
 		"GIT_AUTHOR_NAME=e2e", "GIT_AUTHOR_EMAIL=e2e@example.com",
 		"GIT_COMMITTER_NAME=e2e", "GIT_COMMITTER_EMAIL=e2e@example.com",
 		// Isolate from the developer's real git config.
@@ -181,7 +181,7 @@ func (h *harness) bucketSize(t *testing.T, prefix string) int64 {
 
 func TestEndToEnd(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/project"
+	remoteURL := "s3ee://" + bucket + "/project"
 
 	// --- push from a fresh repository ---
 	alice := t.TempDir()
@@ -264,7 +264,7 @@ func TestEndToEnd(t *testing.T) {
 
 func TestCloneWithoutIdentityFails(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/locked"
+	remoteURL := "s3ee://" + bucket + "/locked"
 
 	src := t.TempDir()
 	h.mustGit(t, src, "init", "-q", "-b", "main")
@@ -275,7 +275,7 @@ func TestCloneWithoutIdentityFails(t *testing.T) {
 	h.mustGit(t, src, "push", "-q", "origin", "main")
 
 	work := t.TempDir()
-	out, err := h.git(t, work, []string{"GIT_REMOTE_R2_AGE_IDENTITY_FILE="}, "clone", remoteURL, "mallory")
+	out, err := h.git(t, work, []string{"GIT_REMOTE_S3EE_AGE_IDENTITY_FILE="}, "clone", remoteURL, "mallory")
 	if err == nil {
 		t.Fatalf("clone without an age identity must fail:\n%s", out)
 	}
@@ -288,7 +288,7 @@ func TestPushTimingSanity(t *testing.T) {
 	// Guards against accidentally re-bundling the world on every helper
 	// invocation: a no-op push should finish quickly.
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/timing"
+	remoteURL := "s3ee://" + bucket + "/timing"
 
 	repo := t.TempDir()
 	h.mustGit(t, repo, "init", "-q", "-b", "main")
@@ -308,19 +308,19 @@ func TestPushTimingSanity(t *testing.T) {
 	}
 }
 
-// TestSetupCommandFlow provisions a repo with `git-remote-r2 setup` alone —
+// TestSetupCommandFlow provisions a repo with `git-remote-s3ee setup` alone —
 // no manual key generation, no env-provided age configuration — then pushes
 // and clones with what setup wrote.
 func TestSetupCommandFlow(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/via-setup"
+	remoteURL := "s3ee://" + bucket + "/via-setup"
 
 	// Drop the env-based age config so only setup's output is in play; keep
 	// endpoint + credentials. XDG_CONFIG_HOME hosts the generated identity.
 	cfgHome := t.TempDir()
 	env := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=",
-		"GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=",
+		"GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + cfgHome,
 	}
 
@@ -332,7 +332,7 @@ func TestSetupCommandFlow(t *testing.T) {
 	h.mustGit(t, repo, "add", ".")
 	h.mustGit(t, repo, "commit", "-q", "-m", "first")
 
-	setup := exec.Command(filepath.Join(h.binDir, "git-remote-r2"), "setup", remoteURL)
+	setup := exec.Command(filepath.Join(h.binDir, "git-remote-s3ee"), "setup", remoteURL)
 	setup.Dir = repo
 	setup.Env = append(append([]string{}, h.baseEnv...), env...)
 	out, err := setup.CombinedOutput()
@@ -372,12 +372,12 @@ func TestSetupCommandFlow(t *testing.T) {
 // TestRecoveryKeyDisasterRecovery walks the full "lost laptop" story:
 // setup mints a recovery key (shown exactly once), the laptop dies, and a
 // brand-new machine regains access with only the recovery secret and the
-// r2:// URL via `key recover` + `git clone`.
+// s3ee:// URL via `key recover` + `git clone`.
 func TestRecoveryKeyDisasterRecovery(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/dr-test"
+	remoteURL := "s3ee://" + bucket + "/dr-test"
 
-	bin := filepath.Join(h.binDir, "git-remote-r2")
+	bin := filepath.Join(h.binDir, "git-remote-s3ee")
 	runBin := func(dir string, env []string, args ...string) (string, error) {
 		cmd := exec.Command(bin, args...)
 		cmd.Dir = dir
@@ -389,7 +389,7 @@ func TestRecoveryKeyDisasterRecovery(t *testing.T) {
 	// Day 0: laptop #1 — setup creates the keyring AND the recovery key.
 	cfgHome1 := t.TempDir()
 	env1 := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + cfgHome1,
 	}
 	repo := t.TempDir()
@@ -423,24 +423,24 @@ func TestRecoveryKeyDisasterRecovery(t *testing.T) {
 	// Day 1: the laptop is gone. New machine: only the secret + URL.
 	cfgHome2 := t.TempDir()
 	env2 := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + cfgHome2,
 	}
 	work := t.TempDir()
 
 	// A wrong recovery key must fail.
 	wrong, _ := age.GenerateX25519Identity()
-	badEnv := append(append([]string{}, env2...), "GIT_REMOTE_R2_RECOVERY_KEY="+wrong.String())
+	badEnv := append(append([]string{}, env2...), "GIT_REMOTE_S3EE_RECOVERY_KEY="+wrong.String())
 	if out, err := runBin(work, badEnv, "key", "recover", remoteURL); err == nil {
 		t.Fatalf("recover with wrong key must fail:\n%s", out)
 	}
 
-	goodEnv := append(append([]string{}, env2...), "GIT_REMOTE_R2_RECOVERY_KEY="+secret)
+	goodEnv := append(append([]string{}, env2...), "GIT_REMOTE_S3EE_RECOVERY_KEY="+secret)
 	out, err = runBin(work, goodEnv, "key", "recover", remoteURL)
 	if err != nil {
 		t.Fatalf("key recover: %v\n%s", err, out)
 	}
-	idPath := filepath.Join(cfgHome2, "git-remote-r2", "identity.txt")
+	idPath := filepath.Join(cfgHome2, "git-remote-s3ee", "identity.txt")
 	if _, err := os.Stat(idPath); err != nil {
 		t.Fatalf("identity not created at default location: %v", err)
 	}
@@ -461,9 +461,9 @@ func TestRecoveryKeyDisasterRecovery(t *testing.T) {
 // the full pre-existing history immediately.
 func TestGrantTeamFlow(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/team-repo"
+	remoteURL := "s3ee://" + bucket + "/team-repo"
 
-	bin := filepath.Join(h.binDir, "git-remote-r2")
+	bin := filepath.Join(h.binDir, "git-remote-s3ee")
 	runBin := func(dir string, env []string, args ...string) (string, error) {
 		cmd := exec.Command(bin, args...)
 		cmd.Dir = dir
@@ -475,7 +475,7 @@ func TestGrantTeamFlow(t *testing.T) {
 	// Alice: setup + push (her key wraps the repo DEK).
 	aliceCfg := t.TempDir()
 	aliceEnv := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + aliceCfg,
 	}
 	repo := t.TempDir()
@@ -505,8 +505,8 @@ func TestGrantTeamFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	bobEnv := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=",
-		"GIT_REMOTE_R2_AGE_IDENTITY_FILE=" + bobIDFile,
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=",
+		"GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=" + bobIDFile,
 		"XDG_CONFIG_HOME=" + t.TempDir(),
 	}
 	work := t.TempDir()
@@ -557,16 +557,16 @@ func TestGrantTeamFlow(t *testing.T) {
 }
 
 // TestSavedCredentialsFlow proves that credentials stored in
-// ~/.config/git-remote-r2/credentials are enough on their own: with no
+// ~/.config/git-remote-s3ee/credentials are enough on their own: with no
 // AWS_* variables in the environment, setup reports the saved
 // entry and git push / clone authenticate through it.
 func TestSavedCredentialsFlow(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/saved-creds"
+	remoteURL := "s3ee://" + bucket + "/saved-creds"
 
 	// Seed the credential store, keyed by the MinIO endpoint.
 	cfgHome := t.TempDir()
-	credDir := filepath.Join(cfgHome, "git-remote-r2")
+	credDir := filepath.Join(cfgHome, "git-remote-s3ee")
 	if err := os.MkdirAll(credDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -579,7 +579,7 @@ func TestSavedCredentialsFlow(t *testing.T) {
 	// Strip every credential variable; only the store remains.
 	env := []string{
 		"AWS_ACCESS_KEY_ID=", "AWS_SECRET_ACCESS_KEY=",
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + cfgHome,
 	}
 
@@ -591,7 +591,7 @@ func TestSavedCredentialsFlow(t *testing.T) {
 	h.mustGit(t, repo, "add", ".")
 	h.mustGit(t, repo, "commit", "-q", "-m", "c")
 
-	setup := exec.Command(filepath.Join(h.binDir, "git-remote-r2"), "setup", remoteURL)
+	setup := exec.Command(filepath.Join(h.binDir, "git-remote-s3ee"), "setup", remoteURL)
 	setup.Dir = repo
 	setup.Env = append(append([]string{}, h.baseEnv...), env...)
 	out, err := setup.CombinedOutput()
@@ -614,7 +614,7 @@ func TestSavedCredentialsFlow(t *testing.T) {
 	}
 }
 
-// TestInteractiveWizardFlow drives `git-remote-r2 setup` with no arguments,
+// TestInteractiveWizardFlow drives `git-remote-s3ee setup` with no arguments,
 // answering the wizard over stdin, then pushes and clones with what it
 // configured.
 func TestInteractiveWizardFlow(t *testing.T) {
@@ -622,7 +622,7 @@ func TestInteractiveWizardFlow(t *testing.T) {
 
 	cfgHome := t.TempDir()
 	env := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + cfgHome,
 	}
 
@@ -634,18 +634,18 @@ func TestInteractiveWizardFlow(t *testing.T) {
 	h.mustGit(t, repo, "add", ".")
 	h.mustGit(t, repo, "commit", "-q", "-m", "c")
 
-	// Answers: backend (Enter → 2, derived from AWS_ENDPOINT_URL in the
-	// env), endpoint (Enter → env default), bucket, prefix, remote name
-	// (Enter → origin).
-	setup := exec.Command(filepath.Join(h.binDir, "git-remote-r2"), "setup")
+	// Answers: endpoint (Enter → AWS_ENDPOINT_URL env default), bucket,
+	// prefix, remote name (Enter → origin), confirmation (Enter → Y).
+	// Credentials are skipped (present in the environment).
+	setup := exec.Command(filepath.Join(h.binDir, "git-remote-s3ee"), "setup")
 	setup.Dir = repo
 	setup.Env = append(append([]string{}, h.baseEnv...), env...)
-	setup.Stdin = strings.NewReader("\n\n" + bucket + "\nwizard-repo\n\n\n")
+	setup.Stdin = strings.NewReader("\n" + bucket + "\nwizard-repo\n\n\n")
 	out, err := setup.CombinedOutput()
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(string(out), "→ r2://"+bucket+"/wizard-repo") {
+	if !strings.Contains(string(out), "→ s3ee://"+bucket+"/wizard-repo") {
 		t.Errorf("wizard should echo the assembled URL:\n%s", out)
 	}
 
@@ -653,7 +653,7 @@ func TestInteractiveWizardFlow(t *testing.T) {
 		t.Fatalf("push after wizard: %v\n%s", err, gout)
 	}
 	work := t.TempDir()
-	if gout, err := h.git(t, work, env, "clone", "-q", "r2://"+bucket+"/wizard-repo", "w"); err != nil {
+	if gout, err := h.git(t, work, env, "clone", "-q", "s3ee://"+bucket+"/wizard-repo", "w"); err != nil {
 		t.Fatalf("clone after wizard: %v\n%s", err, gout)
 	}
 	if data, err := os.ReadFile(filepath.Join(work, "w", "w.txt")); err != nil || string(data) != "wizard\n" {
@@ -667,7 +667,7 @@ func TestInteractiveWizardFlow(t *testing.T) {
 // a small fraction of the repository size.
 func TestDedupAcrossPushesAndTags(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/dedup"
+	remoteURL := "s3ee://" + bucket + "/dedup"
 
 	repo := t.TempDir()
 	h.mustGit(t, repo, "init", "-q", "-b", "main")
@@ -710,14 +710,14 @@ func TestDedupAcrossPushesAndTags(t *testing.T) {
 	t.Logf("sizes: base=%d afterTag=+%d afterCommit=+%d", base, afterTag-base, afterCommit-afterTag)
 }
 
-// TestCloneCommandFlow: onboarding machine #2 with `git-remote-r2 clone`.
+// TestCloneCommandFlow: onboarding machine #2 with `git-remote-s3ee clone`.
 // First run has no access — it prints the machine's public key and the
 // exact grant command; after a member grants it, the re-run clones.
 func TestCloneCommandFlow(t *testing.T) {
 	h := newHarness(t)
-	remoteURL := "r2://" + bucket + "/clone-cmd"
+	remoteURL := "s3ee://" + bucket + "/clone-cmd"
 
-	bin := filepath.Join(h.binDir, "git-remote-r2")
+	bin := filepath.Join(h.binDir, "git-remote-s3ee")
 	runBin := func(dir string, env []string, args ...string) (string, error) {
 		cmd := exec.Command(bin, args...)
 		cmd.Dir = dir
@@ -728,7 +728,7 @@ func TestCloneCommandFlow(t *testing.T) {
 
 	// Alice publishes the repository.
 	aliceEnv := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + t.TempDir(),
 	}
 	repo := t.TempDir()
@@ -747,7 +747,7 @@ func TestCloneCommandFlow(t *testing.T) {
 
 	// Bob's fresh machine: `clone` refuses with actionable instructions.
 	bobEnv := []string{
-		"GIT_REMOTE_R2_AGE_RECIPIENTS=", "GIT_REMOTE_R2_AGE_IDENTITY_FILE=",
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
 		"XDG_CONFIG_HOME=" + t.TempDir(),
 	}
 	work := t.TempDir()

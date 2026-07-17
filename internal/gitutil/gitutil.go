@@ -58,7 +58,7 @@ func (g Git) IsAncestor(ancestor, descendant string) (bool, error) {
 // sha to path. Bundles need a ref name in their header, so the object is
 // pinned under a temporary ref for the duration of the call.
 func (g Git) BundleCreate(path, sha string) error {
-	tmpRef := "refs/git-remote-r2/push-" + sha[:12]
+	tmpRef := "refs/git-remote-s3ee/push-" + sha[:12]
 	if _, err := g.run("update-ref", tmpRef, sha); err != nil {
 		return err
 	}

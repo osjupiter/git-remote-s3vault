@@ -27,8 +27,8 @@ import (
 
 	"filippo.io/age"
 
-	"github.com/osjupiter/git-remote-r2/internal/cryptox"
-	"github.com/osjupiter/git-remote-r2/internal/storage"
+	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
 const (

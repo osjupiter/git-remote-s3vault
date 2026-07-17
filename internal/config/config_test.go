@@ -25,12 +25,12 @@ func TestParseURL(t *testing.T) {
 		prefix  string
 		wantErr bool
 	}{
-		{"r2://my-bucket/team/repo", "my-bucket", "team/repo", false},
-		{"r2://my-bucket", "my-bucket", "", false},
-		{"r2://my-bucket/", "my-bucket", "", false},
+		{"s3ee://my-bucket/team/repo", "my-bucket", "team/repo", false},
+		{"s3ee://my-bucket", "my-bucket", "", false},
+		{"s3ee://my-bucket/", "my-bucket", "", false},
 		{"s3://other/deep/nested/path/", "other", "deep/nested/path", false},
 		{"https://example.com/x", "", "", true},
-		{"r2:///no-bucket", "", "", true},
+		{"s3ee:///no-bucket", "", "", true},
 	}
 	for _, tc := range cases {
 		c, err := load("origin", tc.url, fakeGit{}, env(nil), nil)
@@ -50,27 +50,9 @@ func TestParseURL(t *testing.T) {
 	}
 }
 
-func TestR2EndpointDerivation(t *testing.T) {
-	c, err := load("origin", "r2://b/p", fakeGit{}, env(map[string]string{
-		"R2_ACCOUNT_ID": "abc123",
-	}), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := "https://abc123.r2.cloudflarestorage.com"; c.Endpoint != want {
-		t.Errorf("endpoint = %q, want %q", c.Endpoint, want)
-	}
-	if c.Region != "auto" {
-		t.Errorf("region = %q, want auto", c.Region)
-	}
-	if c.UsePathStyle {
-		t.Error("R2 should not use path style by default")
-	}
-}
-
-func TestExplicitEndpointWinsAndPathStyleHeuristic(t *testing.T) {
+func TestEndpointAndPathStyleHeuristic(t *testing.T) {
+	// Self-hosted endpoint → path style.
 	c, err := load("origin", "s3://b/p", fakeGit{}, env(map[string]string{
-		"R2_ACCOUNT_ID":    "abc123",
 		"AWS_ENDPOINT_URL": "http://127.0.0.1:9000",
 	}), nil)
 	if err != nil {
@@ -82,21 +64,43 @@ func TestExplicitEndpointWinsAndPathStyleHeuristic(t *testing.T) {
 	if !c.UsePathStyle {
 		t.Error("self-hosted endpoint should default to path style")
 	}
+
+	// R2 and AWS endpoints → virtual-hosted style.
+	for _, ep := range []string{"https://abc.r2.cloudflarestorage.com", "https://s3.eu-central-1.amazonaws.com", ""} {
+		c, err := load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
+			"GIT_REMOTE_S3EE_ENDPOINT": ep,
+		}), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.UsePathStyle {
+			t.Errorf("endpoint %q should not use path style", ep)
+		}
+	}
+
+	// Default region.
+	c, err = load("origin", "s3ee://b", fakeGit{}, env(nil), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Region != "us-east-1" {
+		t.Errorf("region = %q, want us-east-1", c.Region)
+	}
 }
 
 func TestGitConfigPrecedence(t *testing.T) {
 	git := fakeGit{
-		"remote.origin.accountid":  {"remote-scoped"},
-		"r2.accountid":             {"global"},
-		"r2.agerecipients":         {"age1aaa", "age1bbb"},
+		"remote.origin.endpoint":   {"https://remote-scoped.example.com"},
+		"s3ee.endpoint":            {"https://global.example.com"},
+		"s3ee.agerecipients":       {"age1aaa", "age1bbb"},
 		"remote.origin.encryption": {"none"},
 	}
-	c, err := load("origin", "r2://b", git, env(nil), nil)
+	c, err := load("origin", "s3ee://b", git, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AccountID != "remote-scoped" {
-		t.Errorf("accountID = %q, want remote-scoped git config to win", c.AccountID)
+	if c.Endpoint != "https://remote-scoped.example.com" {
+		t.Errorf("endpoint = %q, want remote-scoped git config to win", c.Endpoint)
 	}
 	if len(c.Recipients) != 2 {
 		t.Errorf("recipients = %v", c.Recipients)
@@ -106,26 +110,26 @@ func TestGitConfigPrecedence(t *testing.T) {
 	}
 
 	// Env beats git config.
-	c, err = load("origin", "r2://b", git, env(map[string]string{"R2_ACCOUNT_ID": "from-env"}), nil)
+	c, err = load("origin", "s3ee://b", git, env(map[string]string{"GIT_REMOTE_S3EE_ENDPOINT": "https://from-env.example.com"}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.AccountID != "from-env" {
-		t.Errorf("accountID = %q, want env to win", c.AccountID)
+	if c.Endpoint != "https://from-env.example.com" {
+		t.Errorf("endpoint = %q, want env to win", c.Endpoint)
 	}
 }
 
 func TestSavedCredentialsResolution(t *testing.T) {
-	stored := func(account, endpoint, bucket string) (string, string, bool) {
-		if account == "acct1" {
+	stored := func(endpoint, bucket string) (string, string, bool) {
+		if endpoint == "https://ep1.example.com" && bucket == "b" {
 			return "stored-key", "stored-secret", true
 		}
 		return "", "", false
 	}
 
 	// Env is empty → saved credentials fill in.
-	c, err := load("origin", "r2://b", fakeGit{}, env(map[string]string{
-		"R2_ACCOUNT_ID": "acct1",
+	c, err := load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3EE_ENDPOINT": "https://ep1.example.com",
 	}), stored)
 	if err != nil {
 		t.Fatal(err)
@@ -135,10 +139,10 @@ func TestSavedCredentialsResolution(t *testing.T) {
 	}
 
 	// Env credentials win over the store.
-	c, err = load("origin", "r2://b", fakeGit{}, env(map[string]string{
-		"R2_ACCOUNT_ID":         "acct1",
-		"AWS_ACCESS_KEY_ID":     "env-key",
-		"AWS_SECRET_ACCESS_KEY": "env-secret",
+	c, err = load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3EE_ENDPOINT": "https://ep1.example.com",
+		"AWS_ACCESS_KEY_ID":        "env-key",
+		"AWS_SECRET_ACCESS_KEY":    "env-secret",
 	}), stored)
 	if err != nil {
 		t.Fatal(err)
@@ -149,8 +153,8 @@ func TestSavedCredentialsResolution(t *testing.T) {
 
 	// No match in the store → left empty (storage.New then rejects the
 	// connection with guidance; there is no AWS-chain fallback).
-	c, err = load("origin", "r2://b", fakeGit{}, env(map[string]string{
-		"R2_ACCOUNT_ID": "unknown-acct",
+	c, err = load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3EE_ENDPOINT": "https://unknown.example.com",
 	}), stored)
 	if err != nil {
 		t.Fatal(err)
@@ -161,15 +165,15 @@ func TestSavedCredentialsResolution(t *testing.T) {
 }
 
 func TestEncryptionDefaultsToAge(t *testing.T) {
-	c, err := load("origin", "r2://b", fakeGit{}, env(nil), nil)
+	c, err := load("origin", "s3ee://b", fakeGit{}, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Encryption != EncryptionAge {
 		t.Errorf("encryption = %q, want age by default", c.Encryption)
 	}
-	if _, err := load("origin", "r2://b", fakeGit{}, env(map[string]string{
-		"GIT_REMOTE_R2_ENCRYPTION": "rot13",
+	if _, err := load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3EE_ENCRYPTION": "rot13",
 	}), nil); err == nil {
 		t.Error("invalid encryption mode should be rejected")
 	}

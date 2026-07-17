@@ -1,4 +1,4 @@
-module github.com/osjupiter/git-remote-r2
+module github.com/osjupiter/git-remote-s3ee
 
 go 1.26.4
 

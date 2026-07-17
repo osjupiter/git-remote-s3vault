@@ -11,25 +11,24 @@ import (
 	"path"
 	"strings"
 
-	"github.com/osjupiter/git-remote-r2/internal/config"
-	"github.com/osjupiter/git-remote-r2/internal/cryptox"
-	"github.com/osjupiter/git-remote-r2/internal/keyring"
-	"github.com/osjupiter/git-remote-r2/internal/storage"
+	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
-// RunClone implements `git-remote-r2 clone <url> [dir]`: the onboarding
+// RunClone implements `git-remote-s3ee clone <url> [dir]`: the onboarding
 // path for a second machine or a teammate. It prepares everything a plain
 // `git clone` would need — machine key, credentials, access — with
 // actionable errors when a step is missing, then runs git clone and
 // persists the backend settings into the fresh repository.
 func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("git-remote-r2 clone", flag.ContinueOnError)
+	fs := flag.NewFlagSet("git-remote-s3ee clone", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	accountID := fs.String("account-id", "", "Cloudflare account ID")
 	endpoint := fs.String("endpoint", "", "explicit S3 endpoint URL (MinIO, AWS, ...)")
-	identityPath := fs.String("identity", "", "machine key file (default: ~/.config/git-remote-r2/identity.txt, generated if missing)")
+	identityPath := fs.String("identity", "", "machine key file (default: ~/.config/git-remote-s3ee/identity.txt, generated if missing)")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: git-remote-r2 clone <r2://bucket/prefix> [directory] [flags]\n\n")
+		fmt.Fprintf(stderr, "usage: git-remote-s3ee clone <s3ee://bucket/prefix> [directory] [flags]\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -45,14 +44,11 @@ func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	// Flags become env vars so both config.Load here and the helper spawned
 	// by git clone resolve the same backend.
-	if *accountID != "" {
-		os.Setenv("GIT_REMOTE_R2_ACCOUNT_ID", *accountID)
-	}
 	if *endpoint != "" {
-		os.Setenv("GIT_REMOTE_R2_ENDPOINT", *endpoint)
+		os.Setenv("GIT_REMOTE_S3EE_ENDPOINT", *endpoint)
 	}
 	if *identityPath != "" {
-		os.Setenv("GIT_REMOTE_R2_AGE_IDENTITY_FILE", *identityPath)
+		os.Setenv("GIT_REMOTE_S3EE_AGE_IDENTITY_FILE", *identityPath)
 	}
 
 	// 1. Machine key.
@@ -101,9 +97,9 @@ func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 			fmt.Fprintf(stdout, "✗ this machine's key has no access to the repository yet.\n\n")
 			for _, r := range recips {
 				fmt.Fprintf(stdout, "  Your public key:\n    %s\n\n", r)
-				fmt.Fprintf(stdout, "  Ask a member to run:\n    git-remote-r2 key grant %s %s\n\n", r, rawURL)
+				fmt.Fprintf(stdout, "  Ask a member to run:\n    git-remote-s3ee key grant %s %s\n\n", r, rawURL)
 			}
-			fmt.Fprintf(stdout, "  Or, if you hold the recovery key:\n    git-remote-r2 key recover %s\n", rawURL)
+			fmt.Fprintf(stdout, "  Or, if you hold the recovery key:\n    git-remote-s3ee key recover %s\n", rawURL)
 			return fmt.Errorf("access not granted yet; re-run clone afterwards")
 		}
 		fmt.Fprintf(stdout, "✓ access confirmed\n")
@@ -131,13 +127,8 @@ func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 		cmd.Dir = dir
 		return cmd.Run()
 	}
-	if err := persist("remote.origin.accountid", cfg.AccountID); err != nil {
+	if err := persist("remote.origin.endpoint", cfg.Endpoint); err != nil {
 		return err
-	}
-	if cfg.AccountID == "" {
-		if err := persist("remote.origin.endpoint", cfg.Endpoint); err != nil {
-			return err
-		}
 	}
 	if *identityPath != "" {
 		if err := persist("remote.origin.ageidentityfile", idPath); err != nil {
