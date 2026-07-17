@@ -239,13 +239,27 @@ func promptCredentials(cfg *config.Config, stdout io.Writer) bool {
 		return false
 	}
 
-	path, section, err := credstore.Save(cfg.AccountID, cfg.Endpoint,
+	// Bucket-scoped tokens are the recommended setup, so bucket-scoped
+	// storage is the default; account-wide is one keystroke away.
+	bucket := cfg.Bucket
+	fmt.Fprintf(tty, "Scope: [B] this bucket only (%s, recommended) / [a] whole account: ", cfg.Bucket)
+	scopeLine, err := bufio.NewReader(tty).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	scopeNote := "for bucket " + cfg.Bucket
+	if s := strings.ToLower(strings.TrimSpace(scopeLine)); s == "a" || s == "account" {
+		bucket = ""
+		scopeNote = "shared by every repo on this account"
+	}
+
+	path, section, err := credstore.Save(cfg.AccountID, cfg.Endpoint, bucket,
 		credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret})
 	if err != nil {
 		fmt.Fprintf(tty, "✗ could not save credentials: %v\n", err)
 		return false
 	}
-	fmt.Fprintf(stdout, "✓ credentials saved to %s [%s] — shared by every repo on this account\n", path, section)
+	fmt.Fprintf(stdout, "✓ credentials saved to %s [%s] — %s\n", path, section, scopeNote)
 	return true
 }
 

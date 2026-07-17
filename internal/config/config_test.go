@@ -116,7 +116,7 @@ func TestGitConfigPrecedence(t *testing.T) {
 }
 
 func TestSavedCredentialsResolution(t *testing.T) {
-	stored := func(account, endpoint string) (string, string, bool) {
+	stored := func(account, endpoint, bucket string) (string, string, bool) {
 		if account == "acct1" {
 			return "stored-key", "stored-secret", true
 		}

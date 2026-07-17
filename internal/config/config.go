@@ -83,16 +83,16 @@ func (execGit) GetAll(key string) []string {
 	return vals
 }
 
-// CredentialLookup finds stored credentials for an account ID or endpoint.
-// It exists as an injection point so the config package stays decoupled
-// from the on-disk store (and testable without touching the filesystem).
-type CredentialLookup func(accountID, endpoint string) (keyID, secret string, ok bool)
+// CredentialLookup finds stored credentials for a bucket, account ID, or
+// endpoint. It exists as an injection point so the config package stays
+// decoupled from the on-disk store (and testable without the filesystem).
+type CredentialLookup func(accountID, endpoint, bucket string) (keyID, secret string, ok bool)
 
 // Load resolves the full configuration for a remote, including saved
 // credentials from ~/.config/git-remote-r2/credentials.
 func Load(remoteName, rawURL string) (*Config, error) {
-	return load(remoteName, rawURL, execGit{}, os.Getenv, func(account, endpoint string) (string, string, bool) {
-		c, ok := credstore.Lookup(account, endpoint)
+	return load(remoteName, rawURL, execGit{}, os.Getenv, func(account, endpoint, bucket string) (string, string, bool) {
+		c, ok := credstore.Lookup(account, endpoint, bucket)
 		return c.AccessKeyID, c.SecretAccessKey, ok
 	})
 }
@@ -154,7 +154,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 	// Saved credentials fill the gap between env vars (which win) and the
 	// AWS default chain (which storage falls back to when these are empty).
 	if c.AccessKeyID == "" && creds != nil {
-		if id, secret, ok := creds(c.AccountID, c.Endpoint); ok {
+		if id, secret, ok := creds(c.AccountID, c.Endpoint, c.Bucket); ok {
 			c.AccessKeyID, c.SecretAccessKey = id, secret
 		}
 	}

@@ -54,7 +54,8 @@ Tip: create an R2 API token scoped to ONLY this bucket (Object Read & Write),
 
 Access Key ID (leave empty to skip and use the AWS default chain): ...
 Secret Access Key:
-✓ credentials saved to ~/.config/git-remote-r2/credentials [account:...] — shared by every repo on this account
+Scope: [B] this bucket only (my-bucket, recommended) / [a] whole account:
+✓ credentials saved to ~/.config/git-remote-r2/credentials [account:... bucket:my-bucket] — for bucket my-bucket
 ✓ bucket reachable; remote is empty (first push will initialize it)
 ✓ repository key created; wrapped for 1 public key(s)
 ✓ recovery key created — store this line in a password manager or on paper:
@@ -69,10 +70,11 @@ All set. Next:
 $ git push -u origin main
 ```
 
-Setup asks for credentials once per account and remembers them in
-`~/.config/git-remote-r2/credentials` (plaintext, 0600 — the same trust
-model as other credential files); the second repository on the same
-account asks nothing.
+Setup remembers credentials in `~/.config/git-remote-r2/credentials`
+(plaintext, 0600 — the same trust model as other credential files).
+Bucket-scoped entries match the recommended one-token-per-bucket setup;
+choose account-wide instead and every repository on the account shares the
+entry without being asked again.
 
 Useful flags: `--remote <name>`, `--recipient <age1...>` (repeatable; add
 teammates or CI public keys), `--account-id <id>`, `--endpoint <url>` (for
@@ -171,8 +173,9 @@ Resolution order:
 
 1. environment — `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`
    (`R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are accepted as aliases)
-2. `~/.config/git-remote-r2/credentials` — written by `setup`, keyed per
-   account (or per endpoint), shared by all repositories on that account
+2. `~/.config/git-remote-r2/credentials` — written by `setup`; entries can
+   be bucket-scoped (`[account:<id> bucket:<name>]`, matching per-bucket
+   tokens) or account/endpoint-wide, with the most specific entry winning
 3. the standard AWS chain (shared config files, IAM roles)
 
 Use **bucket-scoped R2 API tokens** (Object Read & Write on a single

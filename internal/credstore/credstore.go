@@ -2,20 +2,21 @@
 // ~/.config/git-remote-r2/credentials.
 //
 // The file is plaintext with 0600 permissions — the same trust model as
-// standard credential files. Entries are keyed by R2 account ID (or, for
-// generic S3 backends, by endpoint), so every repository on the same
-// account shares one entry:
+// standard credential files. Because the recommended setup is one
+// bucket-scoped API token per repository, entries are keyed by bucket
+// first, with account- or endpoint-wide entries as fallback:
 //
-//	[account:abc123]
-//	access_key_id = AKIA...
+//	[account:abc123 bucket:my-repo]      # bucket-scoped token (recommended)
+//	access_key_id = ...
 //	secret_access_key = ...
 //
-//	[endpoint:http://127.0.0.1:9000]
-//	access_key_id = minioadmin
-//	secret_access_key = minioadmin
+//	[account:abc123]                     # account-wide fallback
+//	...
 //
-// Prefer bucket-scoped R2 API tokens (Object Read & Write on one bucket)
-// so that a leaked key cannot touch anything else.
+//	[endpoint:http://127.0.0.1:9000]     # generic S3 backends
+//	...
+//
+// Lookup order: account+bucket, endpoint+bucket, account, endpoint.
 package credstore
 
 import (
@@ -40,23 +41,33 @@ func Path() (string, error) {
 	return filepath.Join(dir, "git-remote-r2", "credentials"), nil
 }
 
-// SectionKey derives the storage key for an account/endpoint pair: the
-// account ID wins because it identifies the R2 account regardless of how
-// many repositories or buckets it holds.
-func SectionKey(accountID, endpoint string) (string, error) {
+// SectionKey derives the storage key. bucket == "" means an account- or
+// endpoint-wide entry; with a bucket the entry applies to that bucket only
+// (matching the recommended one-token-per-bucket setup).
+func SectionKey(accountID, endpoint, bucket string) (string, error) {
+	var base string
 	switch {
 	case accountID != "":
-		return "account:" + accountID, nil
+		base = "account:" + accountID
 	case endpoint != "":
-		return "endpoint:" + strings.TrimRight(endpoint, "/"), nil
+		base = "endpoint:" + strings.TrimRight(endpoint, "/")
+	}
+	switch {
+	case base != "" && bucket != "":
+		return base + " bucket:" + bucket, nil
+	case base != "":
+		return base, nil
+	case bucket != "":
+		return "bucket:" + bucket, nil
 	default:
-		return "", fmt.Errorf("neither an account ID nor an endpoint is configured")
+		return "", fmt.Errorf("neither an account ID, an endpoint, nor a bucket is configured")
 	}
 }
 
-// Lookup finds stored credentials for the account (preferred) or endpoint.
-// A missing or unreadable file is treated as "no credentials".
-func Lookup(accountID, endpoint string) (Credentials, bool) {
+// Lookup finds stored credentials, most specific entry first:
+// account+bucket, endpoint+bucket, account, endpoint. A missing or
+// unreadable file is treated as "no credentials".
+func Lookup(accountID, endpoint, bucket string) (Credentials, bool) {
 	path, err := Path()
 	if err != nil {
 		return Credentials{}, false
@@ -65,12 +76,24 @@ func Lookup(accountID, endpoint string) (Credentials, bool) {
 	if err != nil {
 		return Credentials{}, false
 	}
+	ep := strings.TrimRight(endpoint, "/")
 	var keys []string
+	if bucket != "" {
+		if accountID != "" {
+			keys = append(keys, "account:"+accountID+" bucket:"+bucket)
+		}
+		if ep != "" {
+			keys = append(keys, "endpoint:"+ep+" bucket:"+bucket)
+		}
+		if accountID == "" && ep == "" {
+			keys = append(keys, "bucket:"+bucket)
+		}
+	}
 	if accountID != "" {
 		keys = append(keys, "account:"+accountID)
 	}
-	if endpoint != "" {
-		keys = append(keys, "endpoint:"+strings.TrimRight(endpoint, "/"))
+	if ep != "" {
+		keys = append(keys, "endpoint:"+ep)
 	}
 	for _, k := range keys {
 		if s, ok := sections.get(k); ok {
@@ -86,14 +109,14 @@ func Lookup(accountID, endpoint string) (Credentials, bool) {
 	return Credentials{}, false
 }
 
-// Save upserts credentials for the account/endpoint and writes the file
-// with 0600 permissions, preserving unrelated entries. It returns the file
-// path and the section name used.
-func Save(accountID, endpoint string, c Credentials) (string, string, error) {
+// Save upserts credentials and writes the file with 0600 permissions,
+// preserving unrelated entries. bucket == "" stores an account- or
+// endpoint-wide entry. It returns the file path and the section name used.
+func Save(accountID, endpoint, bucket string, c Credentials) (string, string, error) {
 	if c.AccessKeyID == "" || c.SecretAccessKey == "" {
 		return "", "", fmt.Errorf("both an access key ID and a secret access key are required")
 	}
-	key, err := SectionKey(accountID, endpoint)
+	key, err := SectionKey(accountID, endpoint, bucket)
 	if err != nil {
 		return "", "", err
 	}
