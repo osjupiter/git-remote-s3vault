@@ -1,26 +1,19 @@
 name: Release
 
-# Two triggers so both flows work:
-#  - pushing a tag with git (`git tag v1.2.3 && git push origin v1.2.3`)
-#  - creating a release in the GitHub UI / via `gh release create`
-#    (API-created tags do not reliably fire push events, so the release
-#    event is required for this path)
-# goreleaser builds the binaries (linux/darwin amd64+arm64, windows
-# amd64) and attaches them, keeping hand-written release notes
-# (release.mode: keep-existing). The concurrency group prevents duplicate
-# runs when both events fire for the same tag.
+# Fires when a release is published — via the GitHub web UI or
+# `gh release create`. goreleaser builds the binaries (linux/darwin
+# amd64+arm64, windows amd64) and attaches them to that release, keeping
+# hand-written notes (release.mode: keep-existing).
+#
+# Deliberately NOT triggered on tag pushes: API-created tags fire push
+# events inconsistently, and when both events fire the second goreleaser
+# run fails on duplicate assets. One flow, one trigger.
 on:
-  push:
-    tags: ["v*"]
   release:
     types: [published]
 
 permissions:
   contents: write
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   goreleaser:
