@@ -8,6 +8,8 @@
 //	<prefix>/.keys/repo.pub          DEK public key (plaintext, safe)
 //	<prefix>/.keys/dek/<label>.age   DEK secret wrapped to one member key
 //	<prefix>/.keys/dek/<label>.pub   that member's public key (for listing)
+//	<prefix>/.keys/seal              integrity seal: HMAC over repo.pub and
+//	                                 all slots, keyed by the DEK secret
 //
 // Granting access = wrapping the DEK to one more public key: a single
 // small upload, no re-encryption of history. Revoking a slot removes
@@ -18,12 +20,14 @@ package keyring
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strings"
 
 	"filippo.io/age"
@@ -35,6 +39,7 @@ import (
 const (
 	repoPubName = "repo.pub"
 	dekDirName  = "dek"
+	sealName    = "seal"
 	// KeysDir is the reserved prefix; the helper must never treat objects
 	// under it as ref bundles.
 	KeysDir = ".keys"
@@ -135,10 +140,13 @@ func (k *Keyring) Init(ctx context.Context, recipientSpecs []string) (*age.X2551
 }
 
 // SetRepoKey publishes (or replaces, during rotation) the repository's
-// public key.
+// public key, then re-seals the keyring under the same DEK.
 func (k *Keyring) SetRepoKey(ctx context.Context, dek *age.X25519Identity) error {
 	pub := dek.Recipient().String() + "\n"
-	return k.store.Put(ctx, k.key(repoPubName), strings.NewReader(pub), int64(len(pub)))
+	if err := k.store.Put(ctx, k.key(repoPubName), strings.NewReader(pub), int64(len(pub))); err != nil {
+		return err
+	}
+	return k.Seal(ctx, dek)
 }
 
 // Grant wraps the DEK to one more public key. label defaults to a
@@ -167,7 +175,10 @@ func (k *Keyring) Grant(ctx context.Context, dek *age.X25519Identity, recipientS
 		return err
 	}
 	spec := strings.TrimSpace(recipientSpec) + "\n"
-	return k.store.Put(ctx, k.key(dekDirName, label+".pub"), strings.NewReader(spec), int64(len(spec)))
+	if err := k.store.Put(ctx, k.key(dekDirName, label+".pub"), strings.NewReader(spec), int64(len(spec))); err != nil {
+		return err
+	}
+	return k.Seal(ctx, dek)
 }
 
 // Slots lists who currently holds a wrapped copy of the DEK.
@@ -274,9 +285,10 @@ func (k *Keyring) Access(ctx context.Context, ids []age.Identity) (*age.X25519Id
 	return nil, false, nil
 }
 
-// Revoke deletes a slot by label or by recipient public key. Returns the
-// removed slot. NOTE: true revocation also requires rotating the DEK.
-func (k *Keyring) Revoke(ctx context.Context, labelOrRecipient string) (*Slot, error) {
+// Revoke deletes a slot by label or by recipient public key and re-seals
+// the keyring (dek may be nil to skip re-sealing). Returns the removed
+// slot. NOTE: true revocation also requires rotating the DEK.
+func (k *Keyring) Revoke(ctx context.Context, dek *age.X25519Identity, labelOrRecipient string) (*Slot, error) {
 	slots, err := k.Slots(ctx)
 	if err != nil {
 		return nil, err
@@ -292,7 +304,94 @@ func (k *Keyring) Revoke(ctx context.Context, labelOrRecipient string) (*Slot, e
 		if err := k.store.Delete(ctx, k.key(dekDirName, s.Label+".pub")); err != nil {
 			return nil, err
 		}
+		if dek != nil {
+			if err := k.Seal(ctx, dek); err != nil {
+				return nil, fmt.Errorf("re-sealing keyring: %w", err)
+			}
+		}
 		return &s, nil
 	}
 	return nil, fmt.Errorf("no key slot matches %q", labelOrRecipient)
+}
+
+// --- keyring integrity seal ---
+//
+// The slot directory is plain objects: anyone with bucket WRITE access
+// could plant or replace a slot's .pub, and the next rotation would
+// happily wrap the new DEK to it — turning write access into future read
+// access. The seal closes that: an HMAC over repo.pub and every slot,
+// keyed by the DEK secret. Members (DEK holders) maintain it; a bucket
+// writer without the DEK cannot forge it. Rotation and grant refuse to
+// proceed when the seal does not match.
+//
+// Limits, honestly: a malicious *member* holds the DEK and can re-seal
+// anything (they can already read all data); and deleting the seal makes
+// the keyring look legacy/unsealed — mutating commands then re-create it,
+// but rotation surfaces the full slot list for review in that case.
+
+// SealStatus is the result of verifying the keyring seal.
+type SealStatus int
+
+const (
+	SealValid   SealStatus = iota // seal present and matches
+	SealMissing                   // no seal (legacy keyring, or deleted)
+	SealInvalid                   // seal present but does NOT match — tampering or corruption
+)
+
+// sealMessage canonically serializes what the seal covers: the repository
+// public key and every slot (label + recorded recipient), sorted.
+func (k *Keyring) sealMessage(ctx context.Context) ([]byte, error) {
+	var b strings.Builder
+	if r, exists, err := k.RepoRecipient(ctx); err != nil {
+		return nil, err
+	} else if exists {
+		b.WriteString("repo " + r.(*age.X25519Recipient).String() + "\n")
+	}
+	slots, err := k.Slots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(slots, func(i, j int) bool { return slots[i].Label < slots[j].Label })
+	for _, s := range slots {
+		b.WriteString("slot " + s.Label + " " + s.Recipient + "\n")
+	}
+	return []byte(b.String()), nil
+}
+
+func sealMAC(dek *age.X25519Identity, msg []byte) string {
+	mac := hmac.New(sha256.New, []byte("git-remote-s3vault keyring seal v1|"+dek.String()))
+	mac.Write(msg)
+	return "v1:" + hex.EncodeToString(mac.Sum(nil))
+}
+
+// Seal writes the integrity seal for the keyring's current contents.
+func (k *Keyring) Seal(ctx context.Context, dek *age.X25519Identity) error {
+	msg, err := k.sealMessage(ctx)
+	if err != nil {
+		return err
+	}
+	line := sealMAC(dek, msg) + "\n"
+	return k.store.Put(ctx, k.key(sealName), strings.NewReader(line), int64(len(line)))
+}
+
+// VerifySeal checks the stored seal against the keyring's current
+// contents under the given DEK.
+func (k *Keyring) VerifySeal(ctx context.Context, dek *age.X25519Identity) (SealStatus, error) {
+	rc, err := k.store.Get(ctx, k.key(sealName))
+	if err != nil {
+		return SealMissing, nil
+	}
+	stored, rerr := io.ReadAll(io.LimitReader(rc, 4096))
+	rc.Close()
+	if rerr != nil {
+		return SealInvalid, rerr
+	}
+	msg, err := k.sealMessage(ctx)
+	if err != nil {
+		return SealInvalid, err
+	}
+	if hmac.Equal([]byte(strings.TrimSpace(string(stored))), []byte(sealMAC(dek, msg))) {
+		return SealValid, nil
+	}
+	return SealInvalid, nil
 }

@@ -754,12 +754,15 @@ func TestDedupAcrossPushesAndTags(t *testing.T) {
 		t.Fatalf("initial push too small (%d bytes) — asset not stored?", base)
 	}
 
-	// A tag points at identical content: near-free.
+	// A tag points at identical content: near-free. The bound is loose
+	// (well under the 3MB asset, which is what must NOT be re-stored):
+	// git's multi-threaded packing is nondeterministic, so consecutive
+	// bundles differ by a few hundred KB of shifted chunks run-to-run.
 	h.mustGit(t, repo, "tag", "v1")
 	h.mustGit(t, repo, "push", "-q", "origin", "v1")
 	afterTag := h.bucketSize(t, "dedup/data/")
-	if growth := afterTag - base; growth > 512<<10 {
-		t.Fatalf("tag push should be nearly free, grew %d bytes", growth)
+	if growth := afterTag - base; growth > 1<<20 {
+		t.Fatalf("tag push should be nearly free, grew %d bytes (repo ~%d)", growth, base)
 	}
 
 	// A small commit re-pushes the full bundle, but only the delta lands.
@@ -770,7 +773,7 @@ func TestDedupAcrossPushesAndTags(t *testing.T) {
 	h.mustGit(t, repo, "commit", "-q", "-m", "small")
 	h.mustGit(t, repo, "push", "-q", "origin", "main")
 	afterCommit := h.bucketSize(t, "dedup/data/")
-	if growth := afterCommit - afterTag; growth > 1<<20 {
+	if growth := afterCommit - afterTag; growth > 3<<19 { // 1.5 MiB, half the asset
 		t.Fatalf("small-commit push should cost a fraction of the repo, grew %d bytes (repo ~%d)", growth, base)
 	}
 	t.Logf("sizes: base=%d afterTag=+%d afterCommit=+%d", base, afterTag-base, afterCommit-afterTag)

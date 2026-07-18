@@ -149,7 +149,7 @@ func TestGrantListRevoke(t *testing.T) {
 	}
 
 	// Revoke by label, then bob is locked out of future unwraps.
-	if _, err := kr.Revoke(ctx, "bob"); err != nil {
+	if _, err := kr.Revoke(ctx, dek, "bob"); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok, _ := kr.Unwrap(ctx, []age.Identity{bob}); ok {
@@ -163,10 +163,10 @@ func TestGrantListRevoke(t *testing.T) {
 	if err := kr.Grant(ctx, dek, bob.Recipient().String(), ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := kr.Revoke(ctx, bob.Recipient().String()); err != nil {
+	if _, err := kr.Revoke(ctx, dek, bob.Recipient().String()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := kr.Revoke(ctx, "nobody"); err == nil {
+	if _, err := kr.Revoke(ctx, dek, "nobody"); err == nil {
 		t.Fatal("revoking an unknown slot must fail")
 	}
 }
@@ -186,5 +186,84 @@ func TestGrantRejectsBadLabelAndKey(t *testing.T) {
 	}
 	if !strings.HasPrefix(DefaultLabel("age1abc"), DefaultLabel("age1abc")) || len(DefaultLabel("x")) != 12 {
 		t.Fatal("DefaultLabel should be a stable 12-char fingerprint")
+	}
+}
+
+// TestSealDetectsPlantedSlot: someone with bucket write access (but no
+// DEK) plants a slot .pub — the seal must flag it, and revoking the rogue
+// slot must repair it.
+func TestSealDetectsPlantedSlot(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	kr := New(mem, "proj")
+	alice := newIdentity(t)
+	dek, err := kr.Init(ctx, []string{alice.Recipient().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Init seals the keyring.
+	if st, err := kr.VerifySeal(ctx, dek); err != nil || st != SealValid {
+		t.Fatalf("fresh keyring should be sealed: %v %v", st, err)
+	}
+
+	// Attacker plants a .pub without the DEK (cannot re-seal).
+	evil := newIdentity(t)
+	pub := evil.Recipient().String() + "\n"
+	if err := mem.Put(ctx, "proj/.keys/dek/evil.pub", strings.NewReader(pub), int64(len(pub))); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := kr.VerifySeal(ctx, dek); st != SealInvalid {
+		t.Fatalf("planted slot must invalidate the seal, got %v", st)
+	}
+
+	// Replacing an existing slot's .pub is caught too.
+	slots, _ := kr.Slots(ctx)
+	if err := mem.Put(ctx, "proj/.keys/dek/"+slots[0].Label+".pub", strings.NewReader(pub), int64(len(pub))); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := kr.VerifySeal(ctx, dek); st != SealInvalid {
+		t.Fatalf("swapped slot pub must invalidate the seal, got %v", st)
+	}
+
+	// Deleting the seal downgrades to "missing", never "valid".
+	if err := mem.Delete(ctx, "proj/.keys/seal"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := kr.VerifySeal(ctx, dek); st != SealMissing {
+		t.Fatalf("deleted seal should report missing, got %v", st)
+	}
+
+	// A member repairs: revoke the rogue slot (restore alice's pub first).
+	alicePub := alice.Recipient().String() + "\n"
+	if err := mem.Put(ctx, "proj/.keys/dek/"+slots[0].Label+".pub", strings.NewReader(alicePub), int64(len(alicePub))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kr.Revoke(ctx, dek, "evil"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := kr.VerifySeal(ctx, dek); st != SealValid {
+		t.Fatalf("revoke must repair the seal, got %v", st)
+	}
+}
+
+// TestSealCoversRepoPub: swapping the repository public key without the
+// DEK is detected.
+func TestSealCoversRepoPub(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+	kr := New(mem, "proj")
+	alice := newIdentity(t)
+	dek, err := kr.Init(ctx, []string{alice.Recipient().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evil := newIdentity(t)
+	pub := evil.Recipient().String() + "\n"
+	if err := mem.Put(ctx, "proj/.keys/repo.pub", strings.NewReader(pub), int64(len(pub))); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := kr.VerifySeal(ctx, dek); st != SealInvalid {
+		t.Fatalf("swapped repo.pub must invalidate the seal, got %v", st)
 	}
 }

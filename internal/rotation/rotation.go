@@ -351,13 +351,32 @@ func (r *Rotator) buildFromPerRef(ctx context.Context, src, dst *kopiax.Repo) (*
 
 // RewrapKeys wraps the new DEK for every existing slot (members and the
 // recovery key) and publishes the new repository public key.
+//
+// Before re-wrapping it verifies the keyring's integrity seal: rotation
+// is exactly the moment a slot planted by someone with mere bucket-write
+// access would be promoted to real access, so a broken seal aborts.
 func (r *Rotator) RewrapKeys(ctx context.Context) error {
 	if r.cfg.Encryption == config.EncryptionNone {
 		return nil
 	}
+	status, err := r.kr.VerifySeal(ctx, r.dekOld)
+	if err != nil {
+		return err
+	}
 	slots, err := r.kr.Slots(ctx)
 	if err != nil {
 		return err
+	}
+	switch status {
+	case keyring.SealInvalid:
+		return fmt.Errorf("keyring integrity seal does NOT match — a slot or the repository\n"+
+			"public key was modified without the repository key (possible tampering by\n"+
+			"someone with bucket write access). NOT re-wrapping keys. Inspect the slots\n"+
+			"with `git-remote-s3vault key list`, remove anything you do not recognize\n"+
+			"with `key revoke <label>` (which repairs the seal), then re-run rotation")
+	case keyring.SealMissing:
+		r.logf("warning: keyring has no integrity seal (pre-seal remote, or the seal was deleted).")
+		r.logf("review the slots receiving the new key:")
 	}
 	for _, s := range slots {
 		if s.Recipient == "" {
@@ -367,11 +386,11 @@ func (r *Rotator) RewrapKeys(ctx context.Context) error {
 		if err := r.kr.Grant(ctx, r.dekNew, s.Recipient, s.Label); err != nil {
 			return fmt.Errorf("re-wrapping slot %q: %w", s.Label, err)
 		}
+		r.logf("re-wrapped slot %-14s %s", s.Label, s.Recipient)
 	}
 	if err := r.kr.SetRepoKey(ctx, r.dekNew); err != nil {
 		return err
 	}
-	r.logf("re-wrapped the new key for %d slot(s)", len(slots))
 	return nil
 }
 

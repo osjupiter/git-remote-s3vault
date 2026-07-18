@@ -104,7 +104,7 @@ func TestGrantListRevokeCLI(t *testing.T) {
 		t.Errorf("list output:\n%s", out)
 	}
 
-	if out, err = run(t, "revoke", "bob"); err != nil {
+	if out, err = run(t, "revoke", "--identity", idPath, "bob"); err != nil {
 		t.Fatalf("revoke: %v\n%s", err, out)
 	}
 	out, _ = run(t, "list")
@@ -201,14 +201,30 @@ func TestRecoveryInitReplacesOldSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	oldSecret := secretRe.FindString(out1)
+
+	// Replacing the recovery key demands proof of the CURRENT secret —
+	// without it (and without --force) the slot must survive untouched.
+	if out, err := run(t, "recovery-init", "--identity", idPath); err == nil {
+		t.Fatalf("replacement without the current secret must fail:\n%s", out)
+	}
+	wrong, _ := age.GenerateX25519Identity()
+	t.Setenv("GIT_REMOTE_S3VAULT_RECOVERY_KEY", wrong.String())
+	if out, err := run(t, "recovery-init", "--identity", idPath); err == nil {
+		t.Fatalf("replacement with a WRONG secret must fail:\n%s", out)
+	}
+
+	// With the correct current secret it goes through.
+	t.Setenv("GIT_REMOTE_S3VAULT_RECOVERY_KEY", oldSecret)
 	out2, err := run(t, "recovery-init", "--identity", idPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldSecret, newSecret := secretRe.FindString(out1), secretRe.FindString(out2)
+	newSecret := secretRe.FindString(out2)
 	if oldSecret == newSecret {
 		t.Fatal("recovery-init must mint a fresh secret")
 	}
+	t.Setenv("GIT_REMOTE_S3VAULT_RECOVERY_KEY", "")
 
 	// The old secret is dead, the new one works.
 	t.Setenv("GIT_REMOTE_S3VAULT_RECOVERY_KEY", oldSecret)
@@ -230,5 +246,64 @@ func TestKeyCommandUsage(t *testing.T) {
 	}
 	if _, err := run(t, "grant"); err == nil {
 		t.Error("grant without a key argument should fail")
+	}
+}
+
+// TestGrantRefusesTamperedKeyring: grant must abort when the keyring
+// seal no longer matches (a slot was planted or swapped with bucket
+// write access), and revoke of the rogue slot must repair it.
+func TestGrantRefusesTamperedKeyring(t *testing.T) {
+	mem := useMemStore(t)
+	idPath, _ := initKeyring(t, mem)
+	inRepoWithRemote(t)
+	ctx := context.Background()
+
+	evil, _ := age.GenerateX25519Identity()
+	pub := evil.Recipient().String() + "\n"
+	if err := mem.Put(ctx, "proj/.keys/dek/evil.pub", strings.NewReader(pub), int64(len(pub))); err != nil {
+		t.Fatal(err)
+	}
+
+	bob, _ := age.GenerateX25519Identity()
+	out, err := run(t, "grant", "--identity", idPath, bob.Recipient().String())
+	if err == nil || !strings.Contains(err.Error(), "integrity seal") {
+		t.Fatalf("grant over a tampered keyring must abort, got %v\n%s", err, out)
+	}
+
+	// list flags the mismatch but still works.
+	out, err = run(t, "list", "--identity", idPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "MISMATCH") {
+		t.Fatalf("list should flag the broken seal:\n%s", out)
+	}
+
+	// revoke repairs; grant works again.
+	if out, err := run(t, "revoke", "--identity", idPath, "evil"); err != nil {
+		t.Fatalf("revoke must repair: %v\n%s", err, out)
+	}
+	if out, err := run(t, "grant", "--identity", idPath, bob.Recipient().String()); err != nil {
+		t.Fatalf("grant after repair: %v\n%s", err, out)
+	}
+}
+
+// TestRecoveryInitForceSkipsProof: --force replaces the recovery key
+// without the current secret (the lost-secret escape hatch), with a
+// warning.
+func TestRecoveryInitForceSkipsProof(t *testing.T) {
+	mem := useMemStore(t)
+	idPath, _ := initKeyring(t, mem)
+	inRepoWithRemote(t)
+
+	if _, err := run(t, "recovery-init", "--identity", idPath); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, "recovery-init", "--identity", idPath, "--force")
+	if err != nil {
+		t.Fatalf("--force must bypass the proof: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "WITHOUT verifying") {
+		t.Fatalf("--force should warn loudly:\n%s", out)
 	}
 }

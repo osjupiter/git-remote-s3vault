@@ -438,6 +438,19 @@ provider can still delete your data or refuse service outright (keep
 clones — every clone is a full copy), and metadata (object sizes, access
 timing, your account identity) remains visible.
 
+The keyring itself is integrity-protected: an HMAC seal (keyed by the
+repository key) covers every key slot, so someone with mere bucket
+**write** access cannot plant a key slot and wait for the next rotation
+to hand them the new key — `key grant` and `key rotate` verify the seal
+and refuse on mismatch (`key revoke` repairs it). Replacing the recovery
+key requires entering the current recovery secret (or an explicit
+`--force`), so a teammate cannot silently swap it out from under
+whoever safeguards it. Honest limits: a malicious *member* holds the
+repository key and can re-seal whatever they like — but they can already
+read everything; and pre-seal keyrings (≤ v0.2.0) are sealed by the
+first grant/revoke/rotate, with rotation printing the full slot list for
+review until then.
+
 ### Caveats
 
 - Pushing creates a full bundle locally even though only deltas are

@@ -484,3 +484,35 @@ func TestRotateMigratesPerRefRemote(t *testing.T) {
 		}
 	}
 }
+
+// TestRotateRefusesTamperedKeyring: a slot planted with bucket write
+// access (no DEK, so the seal cannot be re-computed) must abort rotation
+// BEFORE any key is re-wrapped — rotation is the moment such a slot
+// would be promoted to real access.
+func TestRotateRefusesTamperedKeyring(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+
+	evil, _ := age.GenerateX25519Identity()
+	pub := evil.Recipient().String() + "\n"
+	if err := e.store.Put(ctx, "repo/.keys/dek/evil.pub", strings.NewReader(pub), int64(len(pub))); err != nil {
+		t.Fatal(err)
+	}
+
+	rot, err := New(ctx, e.cfg, e.store, e.dekOld, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = rot.Run(ctx)
+	if err == nil || !strings.Contains(err.Error(), "integrity seal") {
+		t.Fatalf("rotation over a tampered keyring must abort, got %v", err)
+	}
+	// The rogue slot must NOT have received a wrapped key.
+	if _, err := e.store.Get(ctx, "repo/.keys/dek/evil.age"); err == nil {
+		t.Fatal("rogue slot was re-wrapped despite the broken seal")
+	}
+	// The generation pointer must be untouched (abort happened pre-flip).
+	if gen := kopiax.CurrentGeneration(ctx, e.store, "repo"); gen != "data" {
+		t.Fatalf("generation must not flip on abort, got %q", gen)
+	}
+}

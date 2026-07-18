@@ -66,6 +66,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	name := fs.String("name", "", "grant: slot label for the new key (default: fingerprint of the public key)")
 	identityFlag := fs.String("identity", "", "identity file to use; default: configured or ~/.config/git-remote-s3vault/identity.txt")
 	yes := fs.Bool("yes", false, "rotate: skip the confirmation prompt")
+	force := fs.Bool("force", false, "recovery-init: replace the recovery key without entering the current one")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -123,11 +124,11 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	case "grant":
 		return grant(ctx, store, cfg, target, *name, *identityFlag, rawURL, stdout)
 	case "list":
-		return list(ctx, store, cfg, stdout)
+		return list(ctx, store, cfg, *identityFlag, stdout)
 	case "revoke":
-		return revoke(ctx, store, cfg, target, stdout)
+		return revoke(ctx, store, cfg, target, *identityFlag, stdout)
 	case "recovery-init":
-		return recoveryInit(ctx, store, cfg, *identityFlag, rawURL, stdout)
+		return recoveryInit(ctx, store, cfg, *identityFlag, rawURL, *force, stdout)
 	case "rotate":
 		return rotate(ctx, store, cfg, *identityFlag, *yes, stdout)
 	default:
@@ -213,6 +214,27 @@ func unwrapDEK(ctx context.Context, store storage.Storage, cfg *config.Config, i
 	return dek, nil
 }
 
+// checkSeal verifies the keyring integrity seal before a write operation.
+// Invalid → hard error (the repair path is `key revoke`, which proceeds
+// with a warning and re-seals). Missing → note that this operation seals
+// the keyring from now on (pre-seal remotes).
+func checkSeal(ctx context.Context, kr *keyring.Keyring, dek *age.X25519Identity, stdout io.Writer) error {
+	status, err := kr.VerifySeal(ctx, dek)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case keyring.SealInvalid:
+		return fmt.Errorf("keyring integrity seal does NOT match — a slot or the repository public key\n" +
+			"was modified without the repository key (possible tampering by someone with\n" +
+			"bucket write access). Inspect `git-remote-s3vault key list`, remove anything\n" +
+			"you do not recognize with `key revoke <label>` (which repairs the seal), then retry")
+	case keyring.SealMissing:
+		fmt.Fprintf(stdout, "note: sealing the keyring (integrity protection added by this version)\n")
+	}
+	return nil
+}
+
 func grant(ctx context.Context, store storage.Storage, cfg *config.Config, pubkey, label, identityFlag, rawURL string, stdout io.Writer) error {
 	if _, err := cryptox.ParseRecipients([]string{pubkey}); err != nil {
 		return err
@@ -222,6 +244,9 @@ func grant(ctx context.Context, store storage.Storage, cfg *config.Config, pubke
 		return err
 	}
 	kr := keyring.New(store, cfg.Prefix)
+	if err := checkSeal(ctx, kr, dek, stdout); err != nil {
+		return err
+	}
 	if err := kr.Grant(ctx, dek, pubkey, label); err != nil {
 		return err
 	}
@@ -234,7 +259,7 @@ func grant(ctx context.Context, store storage.Storage, cfg *config.Config, pubke
 	return nil
 }
 
-func list(ctx context.Context, store storage.Storage, cfg *config.Config, stdout io.Writer) error {
+func list(ctx context.Context, store storage.Storage, cfg *config.Config, identityFlag string, stdout io.Writer) error {
 	kr := keyring.New(store, cfg.Prefix)
 	if _, exists, err := kr.RepoRecipient(ctx); err != nil {
 		return err
@@ -254,12 +279,43 @@ func list(ctx context.Context, store storage.Storage, cfg *config.Config, stdout
 		}
 		fmt.Fprintf(stdout, "  %-14s %s\n", s.Label, rec)
 	}
+	// Integrity check is best-effort here: it needs the DEK, and list
+	// should keep working for members who only want to look.
+	if dek, err := unwrapDEK(ctx, store, cfg, identityFlag); err == nil {
+		status, verr := kr.VerifySeal(ctx, dek)
+		if verr != nil {
+			return verr
+		}
+		switch status {
+		case keyring.SealValid:
+			fmt.Fprintf(stdout, "seal: ✓ valid (slots verified against the repository key)\n")
+		case keyring.SealMissing:
+			fmt.Fprintf(stdout, "seal: none yet — the next grant/revoke/rotate will create it\n")
+		case keyring.SealInvalid:
+			fmt.Fprintf(stdout, "seal: ✖ MISMATCH — a slot or repo.pub changed without the repository key.\n")
+			fmt.Fprintf(stdout, "      Check the list above; `key revoke` unknown slots (repairs the seal).\n")
+		}
+	}
 	return nil
 }
 
-func revoke(ctx context.Context, store storage.Storage, cfg *config.Config, target string, stdout io.Writer) error {
+func revoke(ctx context.Context, store storage.Storage, cfg *config.Config, target, identityFlag string, stdout io.Writer) error {
 	kr := keyring.New(store, cfg.Prefix)
-	slot, err := kr.Revoke(ctx, target)
+	var dek *age.X25519Identity
+	if cfg.Encryption == config.EncryptionAge {
+		var err error
+		if dek, err = unwrapDEK(ctx, store, cfg, identityFlag); err != nil {
+			return err
+		}
+		// Revoke is the repair path for a broken seal, so a mismatch warns
+		// instead of aborting — removing the rogue slot re-seals cleanly.
+		if status, err := kr.VerifySeal(ctx, dek); err != nil {
+			return err
+		} else if status == keyring.SealInvalid {
+			fmt.Fprintf(stdout, "⚠ keyring seal mismatch — revoking will repair the seal over the remaining slots\n")
+		}
+	}
+	slot, err := kr.Revoke(ctx, dek, target)
 	if err != nil {
 		return err
 	}
@@ -273,17 +329,59 @@ func revoke(ctx context.Context, store storage.Storage, cfg *config.Config, targ
 }
 
 // recoveryInit creates (or replaces) the recovery key slot. Replacing it
-// invalidates any previously issued recovery secret for future unwraps.
-func recoveryInit(ctx context.Context, store storage.Storage, cfg *config.Config, identityFlag, rawURL string, stdout io.Writer) error {
+// invalidates any previously issued recovery secret for future unwraps,
+// so replacement demands proof of the CURRENT recovery secret — any
+// member silently swapping the recovery key would strand whoever keeps
+// the real one (typically the admin). --force skips the proof for when
+// the current secret is genuinely lost.
+func recoveryInit(ctx context.Context, store storage.Storage, cfg *config.Config, identityFlag, rawURL string, force bool, stdout io.Writer) error {
 	dek, err := unwrapDEK(ctx, store, cfg, identityFlag)
 	if err != nil {
 		return err
 	}
+	kr := keyring.New(store, cfg.Prefix)
+	if err := checkSeal(ctx, kr, dek, stdout); err != nil {
+		return err
+	}
+
+	var existing *keyring.Slot
+	if slots, err := kr.Slots(ctx); err != nil {
+		return err
+	} else {
+		for i := range slots {
+			if slots[i].Label == keyring.RecoveryLabel {
+				existing = &slots[i]
+				break
+			}
+		}
+	}
+	switch {
+	case existing != nil && !force:
+		fmt.Fprintf(stdout, "A recovery key already exists. Replacing it makes the OLD recovery secret\n")
+		fmt.Fprintf(stdout, "useless, so the current one must be entered (or pass --force if it is lost).\n")
+		secret, err := readRecoverySecret()
+		if err != nil {
+			return err
+		}
+		current, err := age.ParseX25519Identity(strings.TrimSpace(secret))
+		if err != nil {
+			return fmt.Errorf("that does not look like a recovery key (expected AGE-SECRET-KEY-1...): %w", err)
+		}
+		if existing.Recipient == "" {
+			return fmt.Errorf("the current recovery slot has no recorded public key to verify against; pass --force to replace it anyway")
+		}
+		if current.Recipient().String() != existing.Recipient {
+			return fmt.Errorf("that key does not match the current recovery slot — not replacing it")
+		}
+	case existing != nil && force:
+		fmt.Fprintf(stdout, "⚠ --force: replacing the recovery key WITHOUT verifying the current one.\n")
+		fmt.Fprintf(stdout, "  The previous recovery secret stops working for future recovery.\n")
+	}
+
 	recovery, err := age.GenerateX25519Identity()
 	if err != nil {
 		return err
 	}
-	kr := keyring.New(store, cfg.Prefix)
 	if err := kr.Grant(ctx, dek, recovery.Recipient().String(), keyring.RecoveryLabel); err != nil {
 		return err
 	}
