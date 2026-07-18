@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/osjupiter/git-remote-s3vault/internal/config"
 )
@@ -25,11 +26,29 @@ type Object struct {
 	LastModified time.Time
 }
 
+// ErrPreconditionFailed is returned by PutIf when the condition does not
+// hold (the object exists, or its ETag changed). The loser of a race
+// simply re-reads and retries or reports — nothing is left behind, which
+// is why conditional writes are used here instead of locks.
+var ErrPreconditionFailed = errors.New("precondition failed")
+
+// ErrConditionalUnsupported is returned by PutIf when the backend cannot
+// enforce conditional writes; callers fall back to an unconditional Put
+// (the pre-conditional-write behavior).
+var ErrConditionalUnsupported = errors.New("backend does not support conditional writes")
+
 // Storage is the minimal object-store interface the helper needs.
 type Storage interface {
 	List(ctx context.Context, prefix string) ([]Object, error)
 	Get(ctx context.Context, key string) (io.ReadCloser, error)
 	Put(ctx context.Context, key string, body io.Reader, size int64) error
+	// PutIf writes key only when a precondition holds: with ifMatch == ""
+	// the object must not exist (create-only); otherwise the stored
+	// object's ETag must equal ifMatch (compare-and-swap).
+	PutIf(ctx context.Context, key string, body io.Reader, size int64, ifMatch string) error
+	// ETag returns the current ETag of key ("" with nil error when the
+	// object does not exist).
+	ETag(ctx context.Context, key string) (string, error)
 	Delete(ctx context.Context, key string) error
 	Exists(ctx context.Context, key string) (bool, error)
 }
@@ -113,6 +132,49 @@ func (s *S3Storage) Put(ctx context.Context, key string, body io.Reader, size in
 		return fmt.Errorf("putting %s: %w", key, err)
 	}
 	return nil
+}
+
+func (s *S3Storage) PutIf(ctx context.Context, key string, body io.Reader, size int64, ifMatch string) error {
+	in := &s3.PutObjectInput{
+		Bucket:        aws.String(s.bucket),
+		Key:           aws.String(key),
+		Body:          body,
+		ContentLength: aws.Int64(size),
+	}
+	if ifMatch == "" {
+		in.IfNoneMatch = aws.String("*")
+	} else {
+		in.IfMatch = aws.String(ifMatch)
+	}
+	_, err := s.client.PutObject(ctx, in)
+	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) {
+			switch apiErr.ErrorCode() {
+			case "PreconditionFailed", "ConditionalRequestConflict":
+				return fmt.Errorf("putting %s: %w", key, ErrPreconditionFailed)
+			case "NotImplemented":
+				return ErrConditionalUnsupported
+			}
+		}
+		return fmt.Errorf("putting %s: %w", key, err)
+	}
+	return nil
+}
+
+func (s *S3Storage) ETag(ctx context.Context, key string) (string, error) {
+	resp, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		var nf *types.NotFound
+		if errors.As(err, &nf) {
+			return "", nil
+		}
+		return "", fmt.Errorf("heading %s: %w", key, err)
+	}
+	return aws.ToString(resp.ETag), nil
 }
 
 func (s *S3Storage) Delete(ctx context.Context, key string) error {

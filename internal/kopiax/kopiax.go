@@ -88,20 +88,29 @@ var genRe = regexp.MustCompile(`^data[0-9]*$`)
 // CurrentGeneration reads the active data generation ("data" when the
 // pointer object is absent).
 func CurrentGeneration(ctx context.Context, st storage.Storage, prefix string) string {
-	rc, err := st.Get(ctx, strings.TrimPrefix(path.Join(prefix, generationKey), "/"))
+	gen, _ := CurrentGenerationInfo(ctx, st, prefix)
+	return gen
+}
+
+// CurrentGenerationInfo also returns the pointer object's ETag ("" when
+// absent), for compare-and-swap flips.
+func CurrentGenerationInfo(ctx context.Context, st storage.Storage, prefix string) (string, string) {
+	key := strings.TrimPrefix(path.Join(prefix, generationKey), "/")
+	etag, _ := st.ETag(ctx, key)
+	rc, err := st.Get(ctx, key)
 	if err != nil {
-		return FirstGeneration
+		return FirstGeneration, ""
 	}
 	defer rc.Close()
 	data, err := io.ReadAll(io.LimitReader(rc, 128))
 	if err != nil {
-		return FirstGeneration
+		return FirstGeneration, ""
 	}
 	gen := strings.TrimSpace(string(data))
 	if !genRe.MatchString(gen) {
-		return FirstGeneration
+		return FirstGeneration, ""
 	}
-	return gen
+	return gen, etag
 }
 
 // NextGeneration returns the generation name following gen.
@@ -113,13 +122,20 @@ func NextGeneration(gen string) string {
 	return fmt.Sprintf("data%d", n+1)
 }
 
-// SetGeneration atomically points the remote at gen.
-func SetGeneration(ctx context.Context, st storage.Storage, prefix, gen string) error {
+// SetGeneration points the remote at gen, compare-and-swap style:
+// expectETag is the pointer's ETag observed when the operation started
+// ("" = the pointer must not exist yet). A concurrent flip makes this
+// fail with storage.ErrPreconditionFailed instead of silently clobbering.
+func SetGeneration(ctx context.Context, st storage.Storage, prefix, gen, expectETag string) error {
 	if !genRe.MatchString(gen) {
 		return fmt.Errorf("invalid generation name %q", gen)
 	}
 	key := strings.TrimPrefix(path.Join(prefix, generationKey), "/")
-	return st.Put(ctx, key, strings.NewReader(gen+"\n"), int64(len(gen)+1))
+	err := st.PutIf(ctx, key, strings.NewReader(gen+"\n"), int64(len(gen)+1), expectETag)
+	if errors.Is(err, storage.ErrConditionalUnsupported) {
+		return st.Put(ctx, key, strings.NewReader(gen+"\n"), int64(len(gen)+1))
+	}
+	return err
 }
 
 // Repo is an open kopia-backed remote repository.

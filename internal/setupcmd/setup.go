@@ -7,6 +7,7 @@ package setupcmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -510,6 +511,12 @@ func syncKeyring(ctx context.Context, store storage.Storage, cfg *config.Config,
 	}
 	if !exists {
 		dek, err := kr.Init(ctx, wanted)
+		if errors.Is(err, keyring.ErrAlreadyInitialized) {
+			// Lost an init race against a concurrent setup; fall through to
+			// the member path below.
+			fmt.Fprintf(stdout, "⚠ another setup initialized the repository key at the same moment; continuing as a member\n")
+			return syncKeyringExisting(ctx, kr, cfg, idPath, wanted, stdout)
+		}
 		if err != nil {
 			return err
 		}
@@ -532,7 +539,13 @@ func syncKeyring(ctx context.Context, store storage.Storage, cfg *config.Config,
 		fmt.Fprintf(stdout, "    git-remote-s3vault key recover %s\n", cfg.RawURL)
 		return nil
 	}
+	return syncKeyringExisting(ctx, kr, cfg, idPath, wanted, stdout)
+}
 
+// syncKeyringExisting handles setup against a keyring somebody already
+// created: grant any locally-wanted keys that are missing (when we can
+// unwrap), and point at `key grant` otherwise.
+func syncKeyringExisting(ctx context.Context, kr *keyring.Keyring, cfg *config.Config, idPath string, wanted []string, stdout io.Writer) error {
 	slots, err := kr.Slots(ctx)
 	if err != nil {
 		return err

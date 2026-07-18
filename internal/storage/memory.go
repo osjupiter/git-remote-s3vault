@@ -16,6 +16,8 @@ type Memory struct {
 	mu      sync.Mutex
 	objects map[string][]byte
 	mtimes  map[string]time.Time
+	etags   map[string]string
+	rev     int
 	clock   time.Time
 }
 
@@ -24,6 +26,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		objects: map[string][]byte{},
 		mtimes:  map[string]time.Time{},
+		etags:   map[string]string{},
 		clock:   time.Unix(1_700_000_000, 0),
 	}
 }
@@ -58,10 +61,42 @@ func (m *Memory) Put(_ context.Context, key string, body io.Reader, _ int64) err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.store(key, data)
+	return nil
+}
+
+// store writes an object and bumps its etag; callers hold the lock.
+func (m *Memory) store(key string, data []byte) {
 	m.objects[key] = data
 	m.clock = m.clock.Add(time.Second)
 	m.mtimes[key] = m.clock
+	m.rev++
+	m.etags[key] = fmt.Sprintf("\"rev-%d\"", m.rev)
+}
+
+func (m *Memory) PutIf(_ context.Context, key string, body io.Reader, _ int64, ifMatch string) error {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, exists := m.etags[key]
+	if ifMatch == "" {
+		if exists {
+			return fmt.Errorf("putting %s: %w", key, ErrPreconditionFailed)
+		}
+	} else if !exists || cur != ifMatch {
+		return fmt.Errorf("putting %s: %w", key, ErrPreconditionFailed)
+	}
+	m.store(key, data)
 	return nil
+}
+
+func (m *Memory) ETag(_ context.Context, key string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.etags[key], nil
 }
 
 func (m *Memory) Delete(_ context.Context, key string) error {
@@ -69,6 +104,7 @@ func (m *Memory) Delete(_ context.Context, key string) error {
 	defer m.mu.Unlock()
 	delete(m.objects, key)
 	delete(m.mtimes, key)
+	delete(m.etags, key)
 	return nil
 }
 

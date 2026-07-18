@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -88,8 +89,18 @@ func (k *Keyring) RepoRecipient(ctx context.Context) (age.Recipient, bool, error
 	return r, true, nil
 }
 
+// ErrAlreadyInitialized is returned by Init when another party created
+// the keyring first (including losing an Init race by a split second).
+var ErrAlreadyInitialized = errors.New("repository key already exists")
+
 // Init generates a fresh DEK, publishes its public key, and wraps its
-// secret to every given recipient spec. Fails if a keyring already exists.
+// secret to every given recipient spec.
+//
+// The repo.pub write is conditional (create-only), so two people running
+// setup against the same fresh remote at the same moment cannot both
+// initialize: exactly one wins, the other gets ErrAlreadyInitialized and
+// proceeds down the "keyring exists" path. Lock-free — a crashed winner
+// leaves a valid keyring, not a stuck lock.
 func (k *Keyring) Init(ctx context.Context, recipientSpecs []string) (*age.X25519Identity, error) {
 	if len(recipientSpecs) == 0 {
 		return nil, fmt.Errorf("at least one public key is required to initialize the repository key")
@@ -97,13 +108,22 @@ func (k *Keyring) Init(ctx context.Context, recipientSpecs []string) (*age.X2551
 	if _, exists, err := k.RepoRecipient(ctx); err != nil {
 		return nil, err
 	} else if exists {
-		return nil, fmt.Errorf("repository key already exists")
+		return nil, ErrAlreadyInitialized
 	}
 	dek, err := age.GenerateX25519Identity()
 	if err != nil {
 		return nil, err
 	}
-	if err := k.SetRepoKey(ctx, dek); err != nil {
+	pub := dek.Recipient().String() + "\n"
+	err = k.store.PutIf(ctx, k.key(repoPubName), strings.NewReader(pub), int64(len(pub)), "")
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		return nil, ErrAlreadyInitialized
+	}
+	if errors.Is(err, storage.ErrConditionalUnsupported) {
+		// Backend cannot guard the race; keep the pre-check-only behavior.
+		err = k.store.Put(ctx, k.key(repoPubName), strings.NewReader(pub), int64(len(pub)))
+	}
+	if err != nil {
 		return nil, err
 	}
 	for _, spec := range recipientSpecs {

@@ -3,6 +3,8 @@ package keyring
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 
@@ -63,6 +65,39 @@ func TestInitUnwrapRoundtrip(t *testing.T) {
 	}
 	if _, ok, _ := kr.Unwrap(ctx, []age.Identity{newIdentity(t)}); ok {
 		t.Fatal("a stranger should not unwrap the DEK")
+	}
+}
+
+// blindStore simulates the init race window: Get pretends repo.pub does
+// not exist (as the loser saw it before the winner's write landed), while
+// the conditional write still sees the truth.
+type blindStore struct {
+	storage.Storage
+	hidden string
+}
+
+func (b *blindStore) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	if key == b.hidden {
+		return nil, errors.New("no such key (simulated race window)")
+	}
+	return b.Storage.Get(ctx, key)
+}
+
+func TestInitRaceLoserGetsAlreadyInitialized(t *testing.T) {
+	ctx := context.Background()
+	mem := storage.NewMemory()
+
+	// Winner initializes for alice.
+	if _, err := New(mem, "proj").Init(ctx, []string{newIdentity(t).Recipient().String()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Loser raced: its existence check saw nothing, but its conditional
+	// write must be rejected — and mapped to ErrAlreadyInitialized.
+	loser := New(&blindStore{Storage: mem, hidden: "proj/.keys/repo.pub"}, "proj")
+	_, err := loser.Init(ctx, []string{newIdentity(t).Recipient().String()})
+	if !errors.Is(err, ErrAlreadyInitialized) {
+		t.Fatalf("race loser must get ErrAlreadyInitialized, got %v", err)
 	}
 }
 

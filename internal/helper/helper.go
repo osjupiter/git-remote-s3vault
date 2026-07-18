@@ -249,6 +249,12 @@ func (h *Helper) repoPassword(ctx context.Context, create bool) (string, error) 
 			return "", err
 		}
 		dek, err := kr.Init(ctx, specs)
+		if errors.Is(err, keyring.ErrAlreadyInitialized) {
+			// Lost an init race: someone else created the keyring between
+			// our check and our write. Join as a regular member instead.
+			h.warnf("repository key was initialized concurrently by someone else; joining as a member")
+			return h.repoPassword(ctx, false)
+		}
 		if err != nil {
 			return "", err
 		}

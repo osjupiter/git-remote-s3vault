@@ -34,7 +34,9 @@ $ git clone s3vault://my-bucket/my-repo
   [age](https://age-encryption.org) (grant a teammate with one command, a
   printed recovery key restores access from nothing). The storage provider
   sees only opaque ciphertext — not even branch names — and bucket
-  credentials alone yield nothing readable.
+  credentials alone yield nothing readable. Nobody in the storage path can
+  content-scan, filter, or mine what you push (see the threat model for
+  the honest limits).
 - **Deduplicated.** Data rides on [kopia](https://kopia.io)'s
   content-defined chunking: pushes upload only changed chunks, and tags or
   branches sharing history cost almost nothing.
@@ -431,7 +433,13 @@ timing, your account identity) remains visible.
   full repack. Do **not** run kopia's own maintenance against the bucket
   — it does not know about the helper's manifests.
 - Two clients force-pushing the same ref at the same instant race
-  last-writer-wins; the ref converges to one of them.
+  last-writer-wins; the ref converges to one of them (nothing is lost —
+  the other side's commits stay in their local clone and the next push
+  surfaces the divergence). Repository-key initialization and rotation
+  generation flips are guarded with lock-free conditional writes
+  (compare-and-swap; supported by R2, AWS S3, and recent MinIO, with a
+  plain-write fallback elsewhere), so concurrent setups or rotations
+  cannot corrupt key material.
 
 ## Development
 

@@ -215,6 +215,34 @@ func TestRotatePostFlipCrashLeavesWorkingRemote(t *testing.T) {
 	e.verifyGeneration(t, "data2", e.newDEK(t).String())
 }
 
+func TestFlipRefusesWhenGenerationChangedConcurrently(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+
+	rot, err := New(ctx, e.cfg, e.store, e.dekOld, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rot.Build(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A concurrent rotation flips the pointer first.
+	_, etag := kopiax.CurrentGenerationInfo(ctx, e.store, "repo")
+	if err := kopiax.SetGeneration(ctx, e.store, "repo", "data5", etag); err != nil {
+		t.Fatal(err)
+	}
+
+	// Our flip must fail loudly instead of clobbering it.
+	err = rot.Flip(ctx)
+	if err == nil || !strings.Contains(err.Error(), "another rotation") {
+		t.Fatalf("expected a concurrent-rotation error, got %v", err)
+	}
+	if gen := kopiax.CurrentGeneration(ctx, e.store, "repo"); gen != "data5" {
+		t.Fatalf("the concurrent flip must stand, got %q", gen)
+	}
+}
+
 func TestSweepRemovesStaleGenerations(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t)

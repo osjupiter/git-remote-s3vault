@@ -28,6 +28,7 @@ package rotation
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -56,6 +57,8 @@ type Rotator struct {
 
 	CurGen  string
 	NextGen string
+
+	pointerETag string // generation pointer's ETag at start ("" = absent)
 }
 
 // New prepares a rotation: resolves generations and loads (or creates and
@@ -68,8 +71,8 @@ func New(ctx context.Context, cfg *config.Config, store storage.Storage, dekOld 
 		kr:     keyring.New(store, cfg.Prefix),
 		out:    out,
 		dekOld: dekOld,
-		CurGen: kopiax.CurrentGeneration(ctx, store, cfg.Prefix),
 	}
+	r.CurGen, r.pointerETag = kopiax.CurrentGenerationInfo(ctx, store, cfg.Prefix)
 	r.NextGen = kopiax.NextGeneration(r.CurGen)
 
 	if cfg.Encryption == config.EncryptionNone {
@@ -260,9 +263,15 @@ func (r *Rotator) RewrapKeys(ctx context.Context) error {
 	return nil
 }
 
-// Flip atomically switches the remote to the new generation.
+// Flip atomically switches the remote to the new generation. The write
+// is a compare-and-swap against the pointer observed at start, so a
+// concurrent rotation cannot be clobbered.
 func (r *Rotator) Flip(ctx context.Context) error {
-	if err := kopiax.SetGeneration(ctx, r.store, r.cfg.Prefix, r.NextGen); err != nil {
+	err := kopiax.SetGeneration(ctx, r.store, r.cfg.Prefix, r.NextGen, r.pointerETag)
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		return fmt.Errorf("another rotation switched the generation while this one was running; aborting without changes (re-run to rotate again)")
+	}
+	if err != nil {
 		return err
 	}
 	r.logf("switched active generation: %s → %s", r.CurGen, r.NextGen)

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -25,7 +26,11 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/testcontainers/testcontainers-go"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
+
 	tctoxiproxy "github.com/testcontainers/testcontainers-go/modules/toxiproxy"
+
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
 const bucket = "git-remotes"
@@ -59,7 +64,7 @@ func newHarnessWithLatency(t *testing.T, delay time.Duration) *harness {
 		t.Fatalf("building helper: %v\n%s", err, out)
 	}
 
-	minioC, err := tcminio.Run(ctx, "minio/minio:RELEASE.2024-01-16T16-07-38Z")
+	minioC, err := tcminio.Run(ctx, "minio/minio:RELEASE.2025-04-22T22-12-26Z")
 	if err != nil {
 		t.Fatalf("starting minio: %v", err)
 	}
@@ -1025,6 +1030,48 @@ func TestKeyRotationFlow(t *testing.T) {
 	}
 	if gout, err := h.git(t, work, recEnv, "clone", "-q", remoteURL, "recovered-post"); err != nil {
 		t.Fatalf("clone via recovered key after rotation: %v\n%s", err, gout)
+	}
+}
+
+// TestConditionalWritesOnRealS3 verifies the CAS primitives (create-only
+// and if-match PUT) against the real S3 backend, since the race guards in
+// keyring.Init and rotation.Flip depend on them.
+func TestConditionalWritesOnRealS3(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	cfg, err := config.Load("origin", "s3vault://"+bucket+"/cas-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Endpoint = h.endpoint
+	cfg.AccessKeyID = h.username
+	cfg.SecretAccessKey = h.password
+	cfg.UsePathStyle = true
+	st, err := storage.New(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create-only: first write wins, second loses.
+	if err := st.PutIf(ctx, "cas-test/obj", strings.NewReader("first"), 5, ""); err != nil {
+		t.Fatalf("create-only write: %v", err)
+	}
+	err = st.PutIf(ctx, "cas-test/obj", strings.NewReader("second"), 6, "")
+	if !errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatalf("second create-only write must fail with ErrPreconditionFailed, got %v", err)
+	}
+
+	// CAS: correct etag succeeds, stale etag fails.
+	etag, err := st.ETag(ctx, "cas-test/obj")
+	if err != nil || etag == "" {
+		t.Fatalf("etag = %q, %v", etag, err)
+	}
+	if err := st.PutIf(ctx, "cas-test/obj", strings.NewReader("second"), 6, etag); err != nil {
+		t.Fatalf("if-match write with current etag: %v", err)
+	}
+	err = st.PutIf(ctx, "cas-test/obj", strings.NewReader("third"), 5, etag)
+	if !errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatalf("stale-etag write must fail with ErrPreconditionFailed, got %v", err)
 	}
 }
 
