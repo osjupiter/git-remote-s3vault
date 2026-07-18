@@ -910,6 +910,124 @@ func TestCloneOverHighLatencyLink(t *testing.T) {
 	}
 }
 
+// TestKeyRotationFlow: revoke a member, rotate the whole repository to a
+// new key (blue/green generation switch), and verify the revoked member
+// is locked out while everyone else — including the recovery key — keeps
+// working, and the old generation is gone from the bucket.
+func TestKeyRotationFlow(t *testing.T) {
+	h := newHarness(t)
+	remoteURL := "s3ee://" + bucket + "/rotate-me"
+
+	bin := filepath.Join(h.binDir, "git-remote-s3ee")
+	runBin := func(dir string, env []string, args ...string) (string, error) {
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = dir
+		cmd.Env = append(append([]string{}, h.baseEnv...), env...)
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+
+	// Alice: setup (capture the recovery secret), push a branch and a tag.
+	aliceEnv := []string{
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+	}
+	repo := t.TempDir()
+	h.mustGit(t, repo, "init", "-q", "-b", "main")
+	if err := os.WriteFile(filepath.Join(repo, "f.txt"), []byte("rotate this\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "c")
+	out, err := runBin(repo, aliceEnv, "setup", remoteURL)
+	if err != nil {
+		t.Fatalf("setup: %v\n%s", err, out)
+	}
+	recoverySecret := regexp.MustCompile(`AGE-SECRET-KEY-1[0-9A-Z]+`).FindString(out)
+	if recoverySecret == "" {
+		t.Fatalf("no recovery secret:\n%s", out)
+	}
+	if gout, err := h.git(t, repo, aliceEnv, "push", "-q", "-u", "origin", "main"); err != nil {
+		t.Fatalf("alice push: %v\n%s", err, gout)
+	}
+	h.mustGit(t, repo, "tag", "v1")
+	if gout, err := h.git(t, repo, aliceEnv, "push", "-q", "origin", "v1"); err != nil {
+		t.Fatalf("alice tag push: %v\n%s", err, gout)
+	}
+
+	// Bob joins, clones, then gets revoked.
+	bob, err := age.GenerateX25519Identity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bobIDFile := filepath.Join(t.TempDir(), "bob.txt")
+	os.WriteFile(bobIDFile, []byte(bob.String()+"\n"), 0o600)
+	bobEnv := []string{
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=",
+		"GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=" + bobIDFile,
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+	}
+	if out, err := runBin(repo, aliceEnv, "key", "grant", "--name", "bob", bob.Recipient().String()); err != nil {
+		t.Fatalf("grant: %v\n%s", err, out)
+	}
+	work := t.TempDir()
+	if gout, err := h.git(t, work, bobEnv, "clone", "-q", remoteURL, "bob-pre"); err != nil {
+		t.Fatalf("bob clone before revoke: %v\n%s", err, gout)
+	}
+	if out, err := runBin(repo, aliceEnv, "key", "revoke", "bob"); err != nil {
+		t.Fatalf("revoke: %v\n%s", err, out)
+	}
+
+	// Rotate. Runs against the URL from outside any repository.
+	out, err = runBin(t.TempDir(), aliceEnv, "key", "rotate", "--yes", remoteURL)
+	if err != nil {
+		t.Fatalf("rotate: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "rotation complete (data → data2)") {
+		t.Fatalf("rotate output:\n%s", out)
+	}
+
+	// Bucket: old generation gone, new one present, pointer flipped.
+	if keys := h.listKeys(t, "rotate-me/data/"); len(keys) != 0 {
+		t.Fatalf("old generation not removed: %v", keys)
+	}
+	if len(h.listKeys(t, "rotate-me/data2/")) == 0 {
+		t.Fatal("new generation missing")
+	}
+
+	// Alice keeps working without any action: pull, push, cold clone.
+	h.mustGit(t, repo, "commit", "-q", "--allow-empty", "-m", "after rotation")
+	if gout, err := h.git(t, repo, aliceEnv, "push", "-q", "origin", "main"); err != nil {
+		t.Fatalf("alice push after rotation: %v\n%s", err, gout)
+	}
+	coldEnv := append(append([]string{}, aliceEnv...), "XDG_CACHE_HOME="+t.TempDir())
+	if gout, err := h.git(t, work, coldEnv, "clone", "-q", remoteURL, "alice-post"); err != nil {
+		t.Fatalf("alice cold clone after rotation: %v\n%s", err, gout)
+	}
+	if refs, err := h.git(t, filepath.Join(work, "alice-post"), aliceEnv, "tag", "-l"); err != nil || !strings.Contains(refs, "v1") {
+		t.Fatalf("tag lost in rotation: %q %v", refs, err)
+	}
+
+	// Bob is locked out (fresh cache so nothing is served locally).
+	bobCold := append(append([]string{}, bobEnv...), "XDG_CACHE_HOME="+t.TempDir())
+	if gout, err := h.git(t, work, bobCold, "clone", "-q", remoteURL, "bob-post"); err == nil {
+		t.Fatalf("revoked bob must not clone after rotation:\n%s", gout)
+	}
+
+	// The recovery secret from BEFORE the rotation still works.
+	recEnv := []string{
+		"GIT_REMOTE_S3EE_AGE_RECIPIENTS=", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE=",
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+		"GIT_REMOTE_S3EE_RECOVERY_KEY=" + recoverySecret,
+	}
+	if out, err := runBin(work, recEnv, "key", "recover", remoteURL); err != nil {
+		t.Fatalf("recover after rotation: %v\n%s", err, out)
+	}
+	if gout, err := h.git(t, work, recEnv, "clone", "-q", remoteURL, "recovered-post"); err != nil {
+		t.Fatalf("clone via recovered key after rotation: %v\n%s", err, gout)
+	}
+}
+
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {

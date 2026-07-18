@@ -306,9 +306,28 @@ $ git-remote-s3ee key grant age1<teammate> ; git-remote-s3ee key list ; git-remo
 ```
 
 `key revoke` removes a member's ability to unwrap the DEK in the future,
-but anyone who already unwrapped it may have cached it — a hard cut-off
-additionally requires rotating the DEK and re-pushing (planned as
-`key rotate`).
+but anyone who already unwrapped it may have cached it. For a hard
+cut-off, rotate:
+
+```console
+$ git-remote-s3ee key rotate
+```
+
+Rotation re-encrypts the **entire repository under a brand-new key**
+(including a new kopia master key — a mere password change would not
+help, since kopia's password only wraps its master key), blue/green
+style: the next data generation (`data2/`, `data3/`, …) is built side by
+side while the remote stays fully usable, every member slot and the
+recovery key are re-wrapped (teammates and the recovery secret keep
+working with no action), then a single small pointer write flips the
+remote over and the old generation is deleted. Every phase is idempotent
+and an interrupted rotation either leaves the remote untouched
+(pre-flip; re-running resumes incrementally) or fully working with only
+garbage to sweep (post-flip). Rotation also acts as a **full repack**:
+force-push debris and deleted branches are garbage-collected by it.
+After rotating, also reissue the bucket's S3 API token — a removed
+member who kept cached key material can do nothing without ciphertext
+access.
 
 **Data layer ([kopia](https://kopia.io)'s repository engine).** Each push
 stores a self-contained git bundle of the ref's full history as a kopia
@@ -343,10 +362,10 @@ Ref names and commit hashes are **not** visible.
   re-compresses everything (20x slower — the helper detects this and
   suggests running `git gc`). The storage format would also allow
   incremental bundles later without a breaking change.
-- There is no garbage collection yet: storage grows by roughly the
-  changed bytes per push and deleted branches free no space. A `gc`
-  command is planned. Do **not** run kopia's own maintenance against the
-  bucket — it does not know about the helper's manifests.
+- Storage grows by roughly the changed bytes per push; deleted branches
+  and force-push debris are reclaimed by `key rotate`, which doubles as a
+  full repack. Do **not** run kopia's own maintenance against the bucket
+  — it does not know about the helper's manifests.
 - Two clients force-pushing the same ref at the same instant race
   last-writer-wins; the ref converges to one of them.
 

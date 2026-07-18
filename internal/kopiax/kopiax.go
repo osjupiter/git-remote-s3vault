@@ -26,6 +26,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/kopia/kopia/repo"
@@ -37,6 +38,7 @@ import (
 	"github.com/kopia/kopia/repo/object"
 
 	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
 // ErrNotInitialized is returned when the remote has no kopia repository
@@ -48,12 +50,12 @@ var ErrNotInitialized = errors.New("remote repository not initialized")
 // secret and provides no confidentiality.
 const PlaintextPassword = "git-remote-s3ee-plaintext-mode"
 
-// NewBlobStorage builds the kopia blob storage for a remote. Tests swap
-// this out for a filesystem-backed store.
-var NewBlobStorage = func(ctx context.Context, cfg *config.Config) (blob.Storage, error) {
+// NewBlobStorage builds the kopia blob storage for one data generation of
+// a remote. Tests swap this out for a filesystem-backed store.
+var NewBlobStorage = func(ctx context.Context, cfg *config.Config, gen string) (blob.Storage, error) {
 	opt := &s3.Options{
 		BucketName:      cfg.Bucket,
-		Prefix:          dataPrefix(cfg),
+		Prefix:          strings.TrimPrefix(path.Join(cfg.Prefix, gen), "/") + "/",
 		AccessKeyID:     cfg.AccessKeyID,
 		SecretAccessKey: cfg.SecretAccessKey,
 		SessionToken:    cfg.SessionToken,
@@ -72,8 +74,52 @@ var NewBlobStorage = func(ctx context.Context, cfg *config.Config) (blob.Storage
 	return s3.New(ctx, opt, false)
 }
 
-func dataPrefix(cfg *config.Config) string {
-	return strings.TrimPrefix(path.Join(cfg.Prefix, "data"), "/") + "/"
+// Data generations: the kopia repository lives under <prefix>/<gen>/ where
+// gen is "data", "data2", "data3", ... A tiny pointer object selects the
+// active one; a full key rotation builds the next generation side by side
+// and flips the pointer atomically.
+const (
+	FirstGeneration = "data"
+	generationKey   = ".keys/generation"
+)
+
+var genRe = regexp.MustCompile(`^data[0-9]*$`)
+
+// CurrentGeneration reads the active data generation ("data" when the
+// pointer object is absent).
+func CurrentGeneration(ctx context.Context, st storage.Storage, prefix string) string {
+	rc, err := st.Get(ctx, strings.TrimPrefix(path.Join(prefix, generationKey), "/"))
+	if err != nil {
+		return FirstGeneration
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, 128))
+	if err != nil {
+		return FirstGeneration
+	}
+	gen := strings.TrimSpace(string(data))
+	if !genRe.MatchString(gen) {
+		return FirstGeneration
+	}
+	return gen
+}
+
+// NextGeneration returns the generation name following gen.
+func NextGeneration(gen string) string {
+	n := 1
+	if s := strings.TrimPrefix(gen, "data"); s != "" {
+		fmt.Sscanf(s, "%d", &n)
+	}
+	return fmt.Sprintf("data%d", n+1)
+}
+
+// SetGeneration atomically points the remote at gen.
+func SetGeneration(ctx context.Context, st storage.Storage, prefix, gen string) error {
+	if !genRe.MatchString(gen) {
+		return fmt.Errorf("invalid generation name %q", gen)
+	}
+	key := strings.TrimPrefix(path.Join(prefix, generationKey), "/")
+	return st.Put(ctx, key, strings.NewReader(gen+"\n"), int64(len(gen)+1))
 }
 
 // Repo is an open kopia-backed remote repository.
@@ -104,11 +150,11 @@ func headLabels() map[string]string {
 	return map[string]string{"type": "githead"}
 }
 
-// Open connects to the remote's kopia repository. When create is true a
-// missing repository is initialized; otherwise ErrNotInitialized is
-// returned for fresh remotes.
-func Open(ctx context.Context, cfg *config.Config, password string, create bool) (*Repo, error) {
-	st, err := NewBlobStorage(ctx, cfg)
+// Open connects to the given data generation of the remote's kopia
+// repository. When create is true a missing repository is initialized;
+// otherwise ErrNotInitialized is returned for fresh remotes.
+func Open(ctx context.Context, cfg *config.Config, password, gen string, create bool) (*Repo, error) {
+	st, err := NewBlobStorage(ctx, cfg, gen)
 	if err != nil {
 		return nil, fmt.Errorf("opening blob storage: %w", err)
 	}
@@ -128,7 +174,7 @@ func Open(ctx context.Context, cfg *config.Config, password string, create bool)
 		}
 	}
 
-	cacheDir, configFile, err := cachePaths(cfg)
+	cacheDir, configFile, err := cachePaths(cfg, gen)
 	if err != nil {
 		return nil, err
 	}
@@ -158,13 +204,14 @@ func Open(ctx context.Context, cfg *config.Config, password string, create bool)
 	return &Repo{rep: rep}, nil
 }
 
-// cachePaths returns the per-remote local cache directory and config file.
-func cachePaths(cfg *config.Config) (string, string, error) {
+// cachePaths returns the per-remote, per-generation local cache directory
+// and config file.
+func cachePaths(cfg *config.Config, gen string) (string, string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", "", fmt.Errorf("resolving cache dir: %w", err)
 	}
-	sum := sha256.Sum256([]byte(cfg.Endpoint + "\x00" + cfg.Bucket + "\x00" + cfg.Prefix))
+	sum := sha256.Sum256([]byte(cfg.Endpoint + "\x00" + cfg.Bucket + "\x00" + cfg.Prefix + "\x00" + gen))
 	dir := filepath.Join(base, "git-remote-s3ee", hex.EncodeToString(sum[:])[:16])
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
@@ -253,6 +300,15 @@ func (r *Repo) PushRef(ctx context.Context, name, sha string, bundle io.Reader, 
 			return nil
 		})
 	return oidStr, err
+}
+
+// SetHead points the remote HEAD at the given refname.
+func (r *Repo) SetHead(ctx context.Context, target string) error {
+	return repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3ee head"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			_, err := w.ReplaceManifests(ctx, headLabels(), headPayload{Target: target})
+			return err
+		})
 }
 
 // DeleteRef removes a ref (the bundle contents remain until a future GC).

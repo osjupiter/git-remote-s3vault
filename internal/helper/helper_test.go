@@ -61,8 +61,12 @@ func newTestEnv(t *testing.T) *testEnv {
 
 	blobDir := t.TempDir()
 	orig := kopiax.NewBlobStorage
-	kopiax.NewBlobStorage = func(ctx context.Context, _ *config.Config) (blob.Storage, error) {
-		return filesystem.New(ctx, &filesystem.Options{Path: blobDir}, true)
+	kopiax.NewBlobStorage = func(ctx context.Context, _ *config.Config, gen string) (blob.Storage, error) {
+		dir := filepath.Join(blobDir, gen)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, err
+		}
+		return filesystem.New(ctx, &filesystem.Options{Path: dir}, true)
 	}
 	t.Cleanup(func() { kopiax.NewBlobStorage = orig })
 

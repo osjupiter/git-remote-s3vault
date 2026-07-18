@@ -54,7 +54,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: git-remote-s3ee <remote-name> <url>")
 		fmt.Fprintln(os.Stderr, "       git-remote-s3ee setup [s3ee://bucket/prefix] [flags]")
 		fmt.Fprintln(os.Stderr, "       git-remote-s3ee clone <s3ee://bucket/prefix> [dir] [flags]")
-		fmt.Fprintln(os.Stderr, "       git-remote-s3ee key grant|list|revoke|recovery-init|recover [args] [flags]")
+		fmt.Fprintln(os.Stderr, "       git-remote-s3ee key grant|list|revoke|recovery-init|recover|rotate [args] [flags]")
 		fmt.Fprintln(os.Stderr, "(without \"setup\", this program is a git remote helper run by git, not directly)")
 		os.Exit(129)
 	}

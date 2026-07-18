@@ -103,8 +103,7 @@ func (k *Keyring) Init(ctx context.Context, recipientSpecs []string) (*age.X2551
 	if err != nil {
 		return nil, err
 	}
-	pub := dek.Recipient().String() + "\n"
-	if err := k.store.Put(ctx, k.key(repoPubName), strings.NewReader(pub), int64(len(pub))); err != nil {
+	if err := k.SetRepoKey(ctx, dek); err != nil {
 		return nil, err
 	}
 	for _, spec := range recipientSpecs {
@@ -113,6 +112,13 @@ func (k *Keyring) Init(ctx context.Context, recipientSpecs []string) (*age.X2551
 		}
 	}
 	return dek, nil
+}
+
+// SetRepoKey publishes (or replaces, during rotation) the repository's
+// public key.
+func (k *Keyring) SetRepoKey(ctx context.Context, dek *age.X25519Identity) error {
+	pub := dek.Recipient().String() + "\n"
+	return k.store.Put(ctx, k.key(repoPubName), strings.NewReader(pub), int64(len(pub)))
 }
 
 // Grant wraps the DEK to one more public key. label defaults to a

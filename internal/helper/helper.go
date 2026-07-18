@@ -199,7 +199,8 @@ func (h *Helper) ensureStore(ctx context.Context) error {
 	return nil
 }
 
-// ensureRepo opens (and with create, initializes) the kopia repository.
+// ensureRepo opens (and with create, initializes) the kopia repository of
+// the currently active data generation.
 func (h *Helper) ensureRepo(ctx context.Context, create bool) error {
 	if h.krepo != nil {
 		return nil
@@ -208,7 +209,11 @@ func (h *Helper) ensureRepo(ctx context.Context, create bool) error {
 	if err != nil {
 		return err
 	}
-	kr, err := kopiax.Open(ctx, h.cfg, pw, create)
+	if err := h.ensureStore(ctx); err != nil {
+		return err
+	}
+	gen := kopiax.CurrentGeneration(ctx, h.store, h.cfg.Prefix)
+	kr, err := kopiax.Open(ctx, h.cfg, pw, gen, create)
 	if err != nil {
 		return err
 	}
