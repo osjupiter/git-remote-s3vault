@@ -584,7 +584,7 @@ func syncKeyringExisting(ctx context.Context, kr *keyring.Keyring, cfg *config.C
 		fmt.Fprintf(stdout, "⚠ repository key exists but this machine's key cannot unwrap it.\n")
 		fmt.Fprintf(stdout, "  Ask an existing member to grant you access:\n")
 		for _, m := range missing {
-			fmt.Fprintf(stdout, "    git-remote-s3vault key grant %s %s\n", m, cfg.RawURL)
+			fmt.Fprintf(stdout, "    git-remote-s3vault key grant %s\n", m)
 		}
 		return nil
 	}

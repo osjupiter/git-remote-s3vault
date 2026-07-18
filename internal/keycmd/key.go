@@ -39,7 +39,7 @@ var newStore = func(ctx context.Context, cfg *config.Config) (storage.Storage, e
 // Run executes `key <grant|list|revoke|recovery-init|recover> [args] [flags]`.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	usage := func() {
-		fmt.Fprintln(stderr, "usage: git-remote-s3vault key grant   <pubkey> [s3vault://...] [flags]   give another key access to the repo")
+		fmt.Fprintln(stderr, "usage: git-remote-s3vault key grant   <pubkey> [flags]              give another key access (run inside the repo)")
 		fmt.Fprintln(stderr, "       git-remote-s3vault key list    [s3vault://bucket/prefix]          show who has access")
 		fmt.Fprintln(stderr, "       git-remote-s3vault key revoke  <label|pubkey> [s3vault://...]     remove a key's access slot")
 		fmt.Fprintln(stderr, "       git-remote-s3vault key recovery-init [s3vault://...] [flags]      (re)create the recovery key")
@@ -79,6 +79,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 		target, pos = pos[0], pos[1:]
 	}
+	// grant is deliberately repository-scoped: inside the clone, the
+	// remote URL, endpoint, and credentials are all unambiguous. A URL
+	// argument would run without the repo's config and mis-resolve them.
+	if sub == "grant" && len(pos) > 0 {
+		return fmt.Errorf("key grant takes no URL — run it inside your clone of the repository")
+	}
 	if len(pos) > 1 {
 		return fmt.Errorf("at most one URL argument is allowed")
 	}
@@ -91,6 +97,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		var err error
 		rawURL, err = remoteURL(*remote)
 		if err != nil {
+			if sub == "grant" {
+				return fmt.Errorf("key grant must run inside a repository with an s3vault remote (none found on %q): %w", *remote, err)
+			}
 			return fmt.Errorf("no URL given and none found on remote %q (outside a repo, pass the s3vault:// URL explicitly): %w", *remote, err)
 		}
 	}

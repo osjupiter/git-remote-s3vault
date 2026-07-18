@@ -116,7 +116,7 @@ func RunClone(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 			fmt.Fprintf(stdout, "✗ this machine's key has no access to the repository yet.\n\n")
 			for _, r := range recips {
 				fmt.Fprintf(stdout, "  Your public key:\n    %s\n\n", r)
-				fmt.Fprintf(stdout, "  Ask a member to run:\n    git-remote-s3vault key grant %s %s\n\n", r, rawURL)
+				fmt.Fprintf(stdout, "  Ask a member to run, inside their clone of this repository:\n    git-remote-s3vault key grant %s\n\n", r)
 			}
 			fmt.Fprintf(stdout, "  Or, if you hold the recovery key:\n    git-remote-s3vault key recover %s\n", rawURL)
 			return fmt.Errorf("access not granted yet; re-run clone afterwards")

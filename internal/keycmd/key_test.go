@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -59,12 +60,35 @@ func run(t *testing.T, args ...string) (string, error) {
 	return out.String(), err
 }
 
+// inRepoWithRemote puts the test into a fresh repository whose origin is
+// the standard test remote — grant is repository-scoped by design.
+func inRepoWithRemote(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	for _, args := range [][]string{
+		{"init", "-q", "-b", "main"},
+		{"remote", "add", "origin", "s3vault://bucket/proj"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+}
+
 func TestGrantListRevokeCLI(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
 	bob, _ := age.GenerateX25519Identity()
+	inRepoWithRemote(t)
 
-	out, err := run(t, "grant", "--identity", idPath, "--name", "bob", bob.Recipient().String(), "s3vault://bucket/proj")
+	// grant takes no URL: the repository's remote supplies it.
+	if out, err := run(t, "grant", "--identity", idPath, "--name", "bob",
+		bob.Recipient().String(), "s3vault://bucket/proj"); err == nil {
+		t.Fatalf("grant with a URL argument must be rejected:\n%s", out)
+	}
+	out, err := run(t, "grant", "--identity", idPath, "--name", "bob", bob.Recipient().String())
 	if err != nil {
 		t.Fatalf("grant: %v\n%s", err, out)
 	}
@@ -95,7 +119,8 @@ func TestGrantRequiresAccess(t *testing.T) {
 	strangerPath, _ := writeIdentity(t) // not granted
 	bob, _ := age.GenerateX25519Identity()
 
-	out, err := run(t, "grant", "--identity", strangerPath, bob.Recipient().String(), "s3vault://bucket/proj")
+	inRepoWithRemote(t)
+	out, err := run(t, "grant", "--identity", strangerPath, bob.Recipient().String())
 	if err == nil {
 		t.Fatalf("a stranger must not be able to grant:\n%s", out)
 	}

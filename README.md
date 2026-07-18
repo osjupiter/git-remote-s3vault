@@ -180,8 +180,8 @@ $ git-remote-s3vault clone s3vault://my-bucket/my-repo
   Your public key:
     age1nEw...
 
-  Ask a member to run:
-    git-remote-s3vault key grant age1nEw... s3vault://my-bucket/my-repo
+  Ask a member to run, inside their clone of this repository:
+    git-remote-s3vault key grant age1nEw...
 
   Or, if you hold the recovery key:
     git-remote-s3vault key recover s3vault://my-bucket/my-repo

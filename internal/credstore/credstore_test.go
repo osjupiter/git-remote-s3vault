@@ -94,6 +94,43 @@ func TestNoCrossEntryFallback(t *testing.T) {
 	}
 }
 
+func TestResolveBucket(t *testing.T) {
+	isolate(t)
+	if _, _, ok := ResolveBucket("repo1"); ok {
+		t.Fatal("empty store must not resolve")
+	}
+	if _, _, err := Save("https://x.example.com", "repo1",
+		Credentials{AccessKeyID: "AKIA1", SecretAccessKey: "s"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Unique entry: both the endpoint and the credentials come back.
+	ep, c, ok := ResolveBucket("repo1")
+	if !ok || ep != "https://x.example.com" || c.AccessKeyID != "AKIA1" {
+		t.Fatalf("resolve = %q, %+v, %v", ep, c, ok)
+	}
+	if _, _, ok := ResolveBucket("other"); ok {
+		t.Fatal("unknown bucket must not resolve")
+	}
+
+	// AWS-style entry (no endpoint) resolves with an empty endpoint.
+	if _, _, err := Save("", "aws-b", Credentials{AccessKeyID: "k", SecretAccessKey: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	if ep, c, ok := ResolveBucket("aws-b"); !ok || ep != "" || c.AccessKeyID != "k" {
+		t.Fatalf("aws resolve = %q, %+v, %v", ep, c, ok)
+	}
+
+	// Two endpoints knowing the same bucket name: ambiguous, never guessed.
+	if _, _, err := Save("https://y.example.com", "repo1",
+		Credentials{AccessKeyID: "AKIA2", SecretAccessKey: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := ResolveBucket("repo1"); ok {
+		t.Fatal("ambiguous bucket must not resolve")
+	}
+}
+
 func TestUpsertPreservesOtherSections(t *testing.T) {
 	isolate(t)
 	ep := "https://x.example.com"

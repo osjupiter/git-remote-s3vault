@@ -80,6 +80,51 @@ func Lookup(endpoint, bucket string) (Credentials, bool) {
 	return Credentials{}, false
 }
 
+// ResolveBucket finds the single entry for bucket regardless of endpoint
+// and returns the endpoint recorded in its section key. This makes the
+// store self-sufficient when a command runs outside the repository (no
+// git config to supply the endpoint), e.g. `key recover s3vault://b/p`
+// just works. Returns ok=false when there is no entry or when multiple
+// endpoints know this bucket (ambiguity is never guessed at).
+func ResolveBucket(bucket string) (endpoint string, c Credentials, ok bool) {
+	if bucket == "" {
+		return "", Credentials{}, false
+	}
+	path, err := Path()
+	if err != nil {
+		return "", Credentials{}, false
+	}
+	sections, err := parseFile(path)
+	if err != nil {
+		return "", Credentials{}, false
+	}
+	matches := 0
+	for _, s := range sections.list {
+		var ep string
+		switch {
+		case s.name == "bucket:"+bucket:
+			ep = ""
+		case strings.HasPrefix(s.name, "endpoint:") && strings.HasSuffix(s.name, " bucket:"+bucket):
+			ep = strings.TrimSuffix(strings.TrimPrefix(s.name, "endpoint:"), " bucket:"+bucket)
+		default:
+			continue
+		}
+		cand := Credentials{
+			AccessKeyID:     s.values["access_key_id"],
+			SecretAccessKey: s.values["secret_access_key"],
+		}
+		if cand.AccessKeyID == "" || cand.SecretAccessKey == "" {
+			continue
+		}
+		matches++
+		endpoint, c = ep, cand
+	}
+	if matches != 1 {
+		return "", Credentials{}, false
+	}
+	return endpoint, c, true
+}
+
 // Save upserts this bucket's credentials and writes the file with 0600
 // permissions, preserving unrelated entries. It returns the file path and
 // the section name used.

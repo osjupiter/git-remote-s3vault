@@ -84,17 +84,23 @@ func (execGit) GetAll(key string) []string {
 	return vals
 }
 
-// CredentialLookup finds stored credentials for an endpoint/bucket pair.
-// It exists as an injection point so the config package stays decoupled
-// from the on-disk store (and testable without the filesystem).
-type CredentialLookup func(endpoint, bucket string) (keyID, secret string, ok bool)
+// CredentialLookup finds stored credentials. With a known endpoint it is
+// an exact (endpoint, bucket) lookup; with endpoint == "" it may resolve
+// the bucket's single known entry and return the endpoint recorded there,
+// making commands work outside the repository. It exists as an injection
+// point so the config package stays decoupled from the on-disk store.
+type CredentialLookup func(endpoint, bucket string) (resolvedEndpoint, keyID, secret string, ok bool)
 
 // Load resolves the full configuration for a remote, including saved
 // credentials from ~/.config/git-remote-s3vault/credentials.
 func Load(remoteName, rawURL string) (*Config, error) {
-	return load(remoteName, rawURL, execGit{}, os.Getenv, func(endpoint, bucket string) (string, string, bool) {
-		c, ok := credstore.Lookup(endpoint, bucket)
-		return c.AccessKeyID, c.SecretAccessKey, ok
+	return load(remoteName, rawURL, execGit{}, os.Getenv, func(endpoint, bucket string) (string, string, string, bool) {
+		if endpoint != "" {
+			c, ok := credstore.Lookup(endpoint, bucket)
+			return endpoint, c.AccessKeyID, c.SecretAccessKey, ok
+		}
+		ep, c, ok := credstore.ResolveBucket(bucket)
+		return ep, c.AccessKeyID, c.SecretAccessKey, ok
 	})
 }
 
@@ -150,10 +156,15 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 	c.AccessKeyID = getenv("AWS_ACCESS_KEY_ID")
 	c.SecretAccessKey = getenv("AWS_SECRET_ACCESS_KEY")
 	c.SessionToken = getenv("AWS_SESSION_TOKEN")
-	// Saved credentials fill in when env vars (which win) are absent.
+	// Saved credentials fill in when env vars (which win) are absent; when
+	// the endpoint is not configured anywhere (running outside the repo),
+	// the store's own record of this bucket supplies it too.
 	if c.AccessKeyID == "" && creds != nil {
-		if id, secret, ok := creds(c.Endpoint, c.Bucket); ok {
+		if ep, id, secret, ok := creds(c.Endpoint, c.Bucket); ok {
 			c.AccessKeyID, c.SecretAccessKey = id, secret
+			if c.Endpoint == "" {
+				c.Endpoint = ep
+			}
 		}
 	}
 

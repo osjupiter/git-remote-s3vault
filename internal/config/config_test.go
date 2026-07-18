@@ -120,11 +120,11 @@ func TestGitConfigPrecedence(t *testing.T) {
 }
 
 func TestSavedCredentialsResolution(t *testing.T) {
-	stored := func(endpoint, bucket string) (string, string, bool) {
+	stored := func(endpoint, bucket string) (string, string, string, bool) {
 		if endpoint == "https://ep1.example.com" && bucket == "b" {
-			return "stored-key", "stored-secret", true
+			return endpoint, "stored-key", "stored-secret", true
 		}
-		return "", "", false
+		return "", "", "", false
 	}
 
 	// Env is empty → saved credentials fill in.
@@ -161,6 +161,29 @@ func TestSavedCredentialsResolution(t *testing.T) {
 	}
 	if c.AccessKeyID != "" {
 		t.Errorf("expected empty credentials, got %q", c.AccessKeyID)
+	}
+}
+
+func TestStoreSuppliesEndpointWhenUnconfigured(t *testing.T) {
+	// Running outside the repository: no endpoint from env or git config.
+	// The store knows this bucket under exactly one endpoint and supplies
+	// both the endpoint and the credentials.
+	stored := func(endpoint, bucket string) (string, string, string, bool) {
+		if endpoint == "" && bucket == "b" {
+			return "http://127.0.0.1:9000", "k", "s", true
+		}
+		return "", "", "", false
+	}
+	c, err := load("origin", "s3vault://b/p", fakeGit{}, env(nil), stored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Endpoint != "http://127.0.0.1:9000" || c.AccessKeyID != "k" {
+		t.Fatalf("endpoint/creds not recovered from the store: %+v", c)
+	}
+	// The path-style heuristic must apply to the discovered endpoint.
+	if !c.UsePathStyle {
+		t.Fatal("path style should be derived from the discovered endpoint")
 	}
 }
 
