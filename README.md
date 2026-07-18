@@ -73,11 +73,11 @@ $ git-remote-s3vault setup
 Interactive setup — Enter accepts the [default].
 
 S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3): https://abc123.r2.cloudflarestorage.com
+Bucket name: my-bucket
 Credentials — tip: use an API token scoped to ONLY the target bucket
 (Object Read & Write), so a leaked key cannot touch anything else.
 Access Key ID (empty to configure later): ...
 Secret Access Key:
-Bucket name: my-bucket
 Prefix inside the bucket [my-repo]:
 Remote name [origin]:
 Which key should be able to decrypt this repository?
@@ -127,7 +127,9 @@ $ git push -u origin main
 
 Setup remembers the token in `~/.config/git-remote-s3vault/credentials`
 (plaintext, 0600 — the same trust model as other credential files), one
-entry per bucket, matching the one-token-per-bucket model.
+entry per bucket, matching the one-token-per-bucket model. Wizards never
+ask twice: saved credentials skip the question, and when the store knows
+exactly one endpoint it becomes the endpoint default.
 
 Useful flags: `--remote <name>`, `--recipient <age1...>` (repeatable; add
 teammates or CI public keys), `--endpoint <url>`, `--identity <path>`,
@@ -160,9 +162,9 @@ $ git-remote-s3vault clone
 Interactive clone — Enter accepts the [default].
 
 S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3): ...
+Bucket name: my-bucket
 Access Key ID (empty to configure later): ...
 Secret Access Key:
-Bucket name: my-bucket
 Prefix inside the bucket: my-repo
 Clone into directory [my-repo]:
 Clone s3vault://my-bucket/my-repo into "my-repo"? [Y]:
@@ -396,6 +398,8 @@ flowchart LR
   checked locally against the advertised remote sha).
 - `list`/`fetch` need no local bookkeeping: git's own object database
   answers "do I already have this?".
+- The local cache (`git-remote-s3vault cache path`) is bounded per remote
+  and safe to delete at any time: `git-remote-s3vault cache clean`.
 
 ### Threat model
 

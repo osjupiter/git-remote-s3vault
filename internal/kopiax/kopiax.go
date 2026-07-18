@@ -220,6 +220,16 @@ func Open(ctx context.Context, cfg *config.Config, password, gen string, create 
 	return &Repo{rep: rep}, nil
 }
 
+// CacheRoot is where all local kopia caches and connection configs live.
+// It is pure cache: deleting it costs only re-downloads.
+func CacheRoot() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("resolving cache dir: %w", err)
+	}
+	return filepath.Join(base, "git-remote-s3vault"), nil
+}
+
 // cachePaths returns the per-remote, per-generation local cache directory
 // and config file.
 func cachePaths(cfg *config.Config, gen string) (string, string, error) {

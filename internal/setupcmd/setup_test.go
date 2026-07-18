@@ -141,7 +141,7 @@ func TestWizardBuildsURLFromAnswers(t *testing.T) {
 	setupRepo(t)
 	// Endpoint, credentials skipped, bucket, prefix, default remote name.
 	out, err := runWithInput(t,
-		"https://ep.example.com\n\nmy-bucket\nmy-prefix\n\n\n",
+		"https://ep.example.com\nmy-bucket\n\nmy-prefix\n\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
@@ -194,11 +194,11 @@ func TestWizardReusesExistingRemote(t *testing.T) {
 	}
 }
 
-func TestWizardCollectsCredentialsBeforeBucket(t *testing.T) {
+func TestWizardCollectsCredentials(t *testing.T) {
 	setupRepo(t)
-	// Endpoint, THEN access key + secret, THEN bucket etc.
+	// Endpoint, bucket, THEN access key + secret (keyed by that pair).
 	out, err := runWithInput(t,
-		"https://ep.example.com\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\n\n",
+		"https://ep.example.com\nmy-bucket\nAKIA123\ntopsecret\nmy-prefix\n\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -212,10 +212,29 @@ func TestWizardCollectsCredentialsBeforeBucket(t *testing.T) {
 	}
 }
 
+func TestWizardSkipsCredsWhenSaved(t *testing.T) {
+	setupRepo(t)
+	if _, _, err := credstore.Save("https://ep.example.com", "my-bucket",
+		credstore.Credentials{AccessKeyID: "saved-k", SecretAccessKey: "saved-s"}); err != nil {
+		t.Fatal(err)
+	}
+	// No credential answers needed at all: endpoint, bucket, prefix,
+	// remote, confirm.
+	out, err := runWithInput(t,
+		"https://ep.example.com\nmy-bucket\nmy-prefix\n\n\n",
+		"--no-verify")
+	if err != nil {
+		t.Fatalf("wizard failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "using saved credentials for this bucket") {
+		t.Errorf("saved credentials should skip the question:\n%s", out)
+	}
+}
+
 func TestWizardAbortDiscardsEnteredCredentials(t *testing.T) {
 	setupRepo(t)
 	out, err := runWithInput(t,
-		"https://ep.example.com\nAKIA123\ntopsecret\nmy-bucket\nmy-prefix\n\nn\n", // decline at confirm
+		"https://ep.example.com\nmy-bucket\nAKIA123\ntopsecret\nmy-prefix\n\nn\n", // decline at confirm
 		"--no-verify")
 	if err == nil {
 		t.Fatalf("declined confirmation must abort:\n%s", out)
@@ -228,7 +247,7 @@ func TestWizardAbortDiscardsEnteredCredentials(t *testing.T) {
 func TestWizardConfirmationAbortsCleanly(t *testing.T) {
 	setupRepo(t)
 	out, err := runWithInput(t,
-		"\n\nmy-bucket\nmy-prefix\n\nn\n", // "n" at the final confirmation
+		"\nmy-bucket\n\nmy-prefix\n\nn\n", // "n" at the final confirmation
 		"--no-verify")
 	if err == nil {
 		t.Fatalf("declined confirmation must abort:\n%s", out)
@@ -245,7 +264,7 @@ func TestWizardStripsPasteArtifacts(t *testing.T) {
 	// would have been — here the sanitized empty-ish answer falls back to
 	// the default instead.
 	out, err := runWithInput(t,
-		"\n\n\x1b[200~my-bucket\x1b[201~\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
+		"\n\x1b[200~my-bucket\x1b[201~\n\nmy-prefix\n\x1b[200~\x1b[201~\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -317,7 +336,7 @@ func TestWizardKeySelectionPicksSpecificAgeKey(t *testing.T) {
 
 	// Candidates: 1,2 = age keys, 3 = generate. Pick the second age key.
 	out, err := runWithInput(t,
-		"\n\nbkt\npfx\n\n2\n\n",
+		"\nbkt\n\npfx\n\n2\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -335,7 +354,7 @@ func TestWizardKeySelectionSSH(t *testing.T) {
 
 	// Candidates: 1,2 age; 3 SSH; 4 generate. Pick the SSH key.
 	out, err := runWithInput(t,
-		"\n\nbkt\npfx\n\n3\n\n",
+		"\nbkt\n\npfx\n\n3\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -355,7 +374,7 @@ func TestWizardSkipsPassphraseProtectedSSHKeys(t *testing.T) {
 
 	// Locked key is not offered: candidates are 2 age keys + generate.
 	out, err := runWithInput(t,
-		"\n\nbkt\npfx\n\n1\n\n",
+		"\nbkt\n\npfx\n\n1\n\n",
 		"--no-verify")
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
@@ -397,7 +416,7 @@ func TestCloneWizardCollectsAnswers(t *testing.T) {
 	var out bytes.Buffer
 	// endpoint, access key, secret, bucket, prefix, dir (default), confirm.
 	a, err := runCloneWizard(strings.NewReader(
-		"https://ep.example.com\nAKIA9\nsss\nbkt\nteam/proj\n\n\n"), &out, "")
+		"https://ep.example.com\nbkt\nAKIA9\nsss\nteam/proj\n\n\n"), &out, "")
 	if err != nil {
 		t.Fatalf("wizard: %v\n%s", err, out.String())
 	}
@@ -414,7 +433,7 @@ func TestCloneWizardAbortSavesNothing(t *testing.T) {
 	setupRepo(t)
 	var out bytes.Buffer
 	_, err := runCloneWizard(strings.NewReader(
-		"https://ep.example.com\nAKIA9\nsss\nbkt\n\n\nn\n"), &out, "")
+		"https://ep.example.com\nbkt\nAKIA9\nsss\n\n\nn\n"), &out, "")
 	if err == nil {
 		t.Fatal("declined confirmation must abort")
 	}

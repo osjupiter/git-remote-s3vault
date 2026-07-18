@@ -392,6 +392,13 @@ func (h *Helper) cmdFetchBatch(ctx context.Context, first string) error {
 		if done[w.sha] {
 			continue
 		}
+		// Already present locally — e.g. a lightweight tag on a commit an
+		// earlier bundle in this batch delivered: no download needed.
+		if h.git.HasObject(w.sha) {
+			h.logf("%s (%s) already present locally; skipping download", w.name, w.sha[:12])
+			done[w.sha] = true
+			continue
+		}
 		if err := h.fetchOne(ctx, w.sha, w.name); err != nil {
 			return fmt.Errorf("fetching %s (%s): %w", w.name, w.sha[:12], err)
 		}

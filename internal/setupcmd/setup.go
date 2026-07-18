@@ -265,19 +265,19 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 		return nil, err
 	}
 
-	// Credentials come right after the backend, before the bucket, so all
-	// connection settings are entered in one block.
-	creds, err := askCredentials(ask, in, stdout)
-	if err != nil {
-		return nil, err
-	}
-
 	var bucket string
 	for bucket == "" {
 		var err error
 		if bucket, err = ask("Bucket name", ""); err != nil {
 			return nil, err
 		}
+	}
+
+	// Credentials come right after the endpoint+bucket pair that keys
+	// them — and are skipped entirely when already known (env or store).
+	creds, err := askCredentials(ask, in, stdout, a.endpoint, bucket)
+	if err != nil {
+		return nil, err
 	}
 
 	prefixDefault := ""
@@ -369,17 +369,29 @@ func newAsk(in *bufio.Reader, stdout io.Writer) func(label, def string) (string,
 	}
 }
 
-// askEndpoint asks for the S3 endpoint with env-derived defaults.
+// askEndpoint asks for the S3 endpoint. Defaults come from the
+// environment, or — when the credential store knows exactly one endpoint
+// — from there, so a second machine setup is mostly Enter-Enter.
 func askEndpoint(ask func(string, string) (string, error)) (string, error) {
 	def := firstNonEmptyEnv("GIT_REMOTE_S3VAULT_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+	if def == "" {
+		if known := credstore.KnownEndpoints(); len(known) == 1 {
+			def = known[0]
+		}
+	}
 	return ask("S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3)", def)
 }
 
-// askCredentials collects an access key pair unless the environment
-// already provides one. Returns nil when skipped.
-func askCredentials(ask func(string, string) (string, error), in *bufio.Reader, stdout io.Writer) (*credstore.Credentials, error) {
+// askCredentials collects an access key pair for endpoint/bucket unless
+// the environment or the credential store already provides one. Returns
+// nil when nothing needs saving.
+func askCredentials(ask func(string, string) (string, error), in *bufio.Reader, stdout io.Writer, endpoint, bucket string) (*credstore.Credentials, error) {
 	if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
 		fmt.Fprintf(stdout, "✓ using credentials from the environment\n")
+		return nil, nil
+	}
+	if _, ok := credstore.Lookup(endpoint, bucket); ok {
+		fmt.Fprintf(stdout, "✓ using saved credentials for this bucket\n")
 		return nil, nil
 	}
 	fmt.Fprintf(stdout, "Credentials — tip: use an API token scoped to ONLY the target bucket\n")

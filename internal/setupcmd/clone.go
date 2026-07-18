@@ -180,16 +180,16 @@ func runCloneWizard(stdin io.Reader, stdout io.Writer, endpointFlag string) (*cl
 			return nil, err
 		}
 	}
-	creds, err := askCredentials(ask, in, stdout)
-	if err != nil {
-		return nil, err
-	}
-
 	var bucket string
 	for bucket == "" {
+		var err error
 		if bucket, err = ask("Bucket name", ""); err != nil {
 			return nil, err
 		}
+	}
+	creds, err := askCredentials(ask, in, stdout, a.endpoint, bucket)
+	if err != nil {
+		return nil, err
 	}
 	prefix, err := ask("Prefix inside the bucket", "")
 	if err != nil {

@@ -125,6 +125,32 @@ func ResolveBucket(bucket string) (endpoint string, c Credentials, ok bool) {
 	return endpoint, c, true
 }
 
+// KnownEndpoints lists the distinct endpoints recorded in the store.
+// When there is exactly one, wizards offer it as the default.
+func KnownEndpoints() []string {
+	path, err := Path()
+	if err != nil {
+		return nil
+	}
+	sections, err := parseFile(path)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range sections.list {
+		if !strings.HasPrefix(s.name, "endpoint:") {
+			continue
+		}
+		ep, _, _ := strings.Cut(strings.TrimPrefix(s.name, "endpoint:"), " bucket:")
+		if ep != "" && !seen[ep] {
+			seen[ep] = true
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
 // Save upserts this bucket's credentials and writes the file with 0600
 // permissions, preserving unrelated entries. It returns the file path and
 // the section name used.
