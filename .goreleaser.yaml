@@ -1,0 +1,47 @@
+version: 2
+
+project_name: git-remote-s3vault
+
+builds:
+  - id: git-remote-s3vault
+    main: ./cmd/git-remote-s3vault
+    binary: git-remote-s3vault
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # 32-bit and exotic combos are not worth the release size.
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github-native
+
+release:
+  # Attach to the release for the pushed tag; creating a release in the
+  # GitHub UI creates the tag, which triggers the workflow, which fills in
+  # the binaries here.
+  mode: keep-existing

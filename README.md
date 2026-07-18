@@ -11,7 +11,18 @@ $ git push origin main
 $ git clone s3vault://my-bucket/my-repo
 ```
 
-## Why this instead of git-remote-s3?
+> [!WARNING]
+> **Losing your keys means losing the repository.** This is real
+> end-to-end encryption: there is no password reset, no provider-side
+> recovery, no backdoor. Always keep at least one of — a granted machine
+> key (`~/.config/git-remote-s3vault/identity.txt`) or the **recovery
+> secret** printed once during setup. If every key is gone, the remote is
+> permanently unreadable; your only way back is a surviving local clone
+> (re-push it under a new key). Since every git clone is a complete copy,
+> keeping the repository cloned on **at least two machines** is a cheap
+> last-resort backup against both key loss and bucket loss.
+
+## Why this instead of [git-remote-s3](https://github.com/awslabs/git-remote-s3)?
 
 - **Single static binary.** Written in Go — no Python, no pip, no runtime.
   Drop `git-remote-s3vault` on your `PATH` and git finds it.
@@ -37,10 +48,12 @@ $ git clone s3vault://my-bucket/my-repo
 $ go install github.com/osjupiter/git-remote-s3vault/cmd/git-remote-s3vault@latest
 ```
 
-or grab a release binary and put it on your `PATH`. Remote URLs use the
-`s3vault://` scheme. Optionally symlink the binary as `git-remote-s3` to
-also serve plain `s3://` URLs (note: that name collides with awslabs'
-git-remote-s3 if you have it installed).
+or grab a [release binary](https://github.com/osjupiter/git-remote-s3vault/releases)
+(linux / macOS amd64+arm64, Windows amd64) and put it on your `PATH` —
+on Windows that's `git-remote-s3vault.exe`, which git discovers the same
+way. Remote URLs use the `s3vault://` scheme. Optionally symlink the
+binary as `git-remote-s3` to also serve plain `s3://` URLs (note: that
+name collides with awslabs' git-remote-s3 if you have it installed).
 
 ## Quick start
 
@@ -116,7 +129,7 @@ teammates or CI public keys), `--endpoint <url>`, `--identity <path>`,
 Re-running setup is safe and idempotent — run it again to add recipients or
 repoint the remote.
 
-Adding a teammate later is one command (see "Envelope encryption" below):
+Adding a teammate later is one command (see "How it works" below):
 
 ```console
 $ git-remote-s3vault key grant age1<their-public-key>
@@ -191,9 +204,11 @@ prints its secret exactly once:
   It will NOT be shown again.
 ```
 
-Store that one line somewhere durable. Losing every device is then a
-non-event — a brand-new machine needs only the recovery secret and the
-URL:
+Store that one line somewhere durable — this is end-to-end encryption,
+so **if every machine key AND the recovery secret are lost, nobody can
+restore access** (see the warning at the top). With it stored safely,
+losing every device is a non-event — a brand-new machine needs only the
+recovery secret and the URL:
 
 ```console
 $ git-remote-s3vault key recover s3vault://my-bucket/my-repo
@@ -291,7 +306,9 @@ The bucket holds two things, cleanly separated:
 <prefix>/.keys/repo.pub           # DEK public key (plaintext — it's public)
 <prefix>/.keys/dek/<label>.age    # DEK, wrapped to one member key (age)
 <prefix>/.keys/dek/<label>.pub    # that member's public key (for `key list`)
+<prefix>/.keys/generation         # which data generation is active
 <prefix>/data/...                 # kopia repository: opaque encrypted blobs
+                                  # (data2/, data3/, … after key rotations)
 ```
 
 **Key layer (age, sops-style).** Every repository gets its own
@@ -376,6 +393,21 @@ $ make test        # unit tests
 $ make e2e         # full git flows against MinIO (needs Docker)
 $ make build
 ```
+
+## Inspired by
+
+- [git-remote-s3](https://github.com/awslabs/git-remote-s3) (awslabs) —
+  the bundles-in-a-bucket git remote this project started from
+- [git-remote-gcrypt](https://spwhitton.name/tech/code/git-remote-gcrypt/)
+  — the pioneer of encrypted git remotes
+- [sops](https://github.com/getsops/sops) — the envelope-encryption key
+  management model (per-repo data key, wrapped per member)
+- [age](https://age-encryption.org) — the key wrapping and recovery-key
+  cryptography
+- [kopia](https://kopia.io) — the deduplicating encrypted storage engine
+  the data layer rides on
+- [aws-vault](https://github.com/99designs/aws-vault) — the "vault"
+  naming lineage
 
 ## License
 
