@@ -2,3 +2,4 @@
 *.bundle
 *.age
 identity.txt
+.claude/
