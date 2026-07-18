@@ -5,10 +5,10 @@ LDFLAGS := -s -w -X main.version=$(VERSION)
 .PHONY: build test e2e vet lint clean install
 
 build:
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/git-remote-s3ee ./cmd/git-remote-s3ee
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/git-remote-s3vault ./cmd/git-remote-s3vault
 
 install:
-	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '$(LDFLAGS)' ./cmd/git-remote-s3ee
+	CGO_ENABLED=0 $(GO) install -trimpath -ldflags '$(LDFLAGS)' ./cmd/git-remote-s3vault
 
 test:
 	$(GO) test ./internal/...

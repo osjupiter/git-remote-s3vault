@@ -10,7 +10,7 @@ import (
 	"filippo.io/age"
 	"filippo.io/age/agessh"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3vault/internal/cryptox"
 )
 
 // keyCandidate is one selectable public key in the wizard.

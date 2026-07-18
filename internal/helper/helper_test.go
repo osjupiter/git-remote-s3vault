@@ -14,10 +14,10 @@ import (
 	"github.com/kopia/kopia/repo/blob"
 	"github.com/kopia/kopia/repo/blob/filesystem"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/config"
-	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
-	"github.com/osjupiter/git-remote-s3ee/internal/kopiax"
-	"github.com/osjupiter/git-remote-s3ee/internal/storage"
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/keyring"
+	"github.com/osjupiter/git-remote-s3vault/internal/kopiax"
+	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
 func git(t *testing.T, dir string, args ...string) string {

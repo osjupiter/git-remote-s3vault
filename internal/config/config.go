@@ -2,7 +2,7 @@
 // remote URL, git configuration, and environment variables.
 //
 // Precedence (highest first): environment variables, remote-scoped git
-// config (remote.<name>.*), global git config (s3ee.*), built-in defaults.
+// config (remote.<name>.*), global git config (s3vault.*), built-in defaults.
 package config
 
 import (
@@ -12,7 +12,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
+	"github.com/osjupiter/git-remote-s3vault/internal/credstore"
 )
 
 // EncryptionMode selects how repository data is protected.
@@ -90,7 +90,7 @@ func (execGit) GetAll(key string) []string {
 type CredentialLookup func(endpoint, bucket string) (keyID, secret string, ok bool)
 
 // Load resolves the full configuration for a remote, including saved
-// credentials from ~/.config/git-remote-s3ee/credentials.
+// credentials from ~/.config/git-remote-s3vault/credentials.
 func Load(remoteName, rawURL string) (*Config, error) {
 	return load(remoteName, rawURL, execGit{}, os.Getenv, func(endpoint, bucket string) (string, string, bool) {
 		c, ok := credstore.Lookup(endpoint, bucket)
@@ -106,7 +106,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 	}
 
 	// lookup returns the first non-empty value among env names, then
-	// remote-scoped git config, then global s3ee.* git config.
+	// remote-scoped git config, then global s3vault.* git config.
 	lookup := func(gitKey string, envNames ...string) string {
 		for _, e := range envNames {
 			if v := getenv(e); v != "" {
@@ -118,7 +118,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 				return v
 			}
 		}
-		if v, ok := git.Get("s3ee." + gitKey); ok && v != "" {
+		if v, ok := git.Get("s3vault." + gitKey); ok && v != "" {
 			return v
 		}
 		return ""
@@ -138,11 +138,11 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 				return vs
 			}
 		}
-		return git.GetAll("s3ee." + gitKey)
+		return git.GetAll("s3vault." + gitKey)
 	}
 
-	c.Endpoint = lookup("endpoint", "GIT_REMOTE_S3EE_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
-	c.Region = lookup("region", "GIT_REMOTE_S3EE_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")
+	c.Endpoint = lookup("endpoint", "GIT_REMOTE_S3VAULT_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+	c.Region = lookup("region", "GIT_REMOTE_S3VAULT_REGION", "AWS_REGION", "AWS_DEFAULT_REGION")
 	if c.Region == "" {
 		c.Region = "us-east-1"
 	}
@@ -157,7 +157,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 		}
 	}
 
-	switch v := lookup("usepathstyle", "GIT_REMOTE_S3EE_PATH_STYLE"); v {
+	switch v := lookup("usepathstyle", "GIT_REMOTE_S3VAULT_PATH_STYLE"); v {
 	case "true", "1", "yes", "on":
 		c.UsePathStyle = true
 	case "false", "0", "no", "off":
@@ -172,7 +172,7 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 		return nil, fmt.Errorf("invalid usepathstyle value %q", v)
 	}
 
-	switch v := lookup("encryption", "GIT_REMOTE_S3EE_ENCRYPTION"); v {
+	switch v := lookup("encryption", "GIT_REMOTE_S3VAULT_ENCRYPTION"); v {
 	case "", "age":
 		c.Encryption = EncryptionAge
 	case "none":
@@ -181,9 +181,9 @@ func load(remoteName, rawURL string, git GitConfigReader, getenv func(string) st
 		return nil, fmt.Errorf("invalid encryption mode %q (want \"age\" or \"none\")", v)
 	}
 
-	c.Recipients = lookupAll("agerecipients", "GIT_REMOTE_S3EE_AGE_RECIPIENTS")
-	c.RecipientFiles = lookupAll("agerecipientsfile", "GIT_REMOTE_S3EE_AGE_RECIPIENTS_FILE")
-	c.IdentityFiles = lookupAll("ageidentityfile", "GIT_REMOTE_S3EE_AGE_IDENTITY_FILE")
+	c.Recipients = lookupAll("agerecipients", "GIT_REMOTE_S3VAULT_AGE_RECIPIENTS")
+	c.RecipientFiles = lookupAll("agerecipientsfile", "GIT_REMOTE_S3VAULT_AGE_RECIPIENTS_FILE")
+	c.IdentityFiles = lookupAll("ageidentityfile", "GIT_REMOTE_S3VAULT_AGE_IDENTITY_FILE")
 
 	return c, nil
 }
@@ -194,7 +194,7 @@ func ValidateURL(raw string) error {
 	return c.parseURL(raw)
 }
 
-// parseURL accepts s3ee://bucket/prefix (and s3://bucket/prefix for
+// parseURL accepts s3vault://bucket/prefix (and s3://bucket/prefix for
 // installations that symlink the binary as git-remote-s3).
 func (c *Config) parseURL(raw string) error {
 	u, err := url.Parse(raw)
@@ -202,9 +202,9 @@ func (c *Config) parseURL(raw string) error {
 		return fmt.Errorf("invalid remote URL %q: %w", raw, err)
 	}
 	switch u.Scheme {
-	case "s3ee", "s3":
+	case "s3vault", "s3":
 	default:
-		return fmt.Errorf("unsupported URL scheme %q (want s3ee:// or s3://)", u.Scheme)
+		return fmt.Errorf("unsupported URL scheme %q (want s3vault:// or s3://)", u.Scheme)
 	}
 	if u.Host == "" {
 		return fmt.Errorf("remote URL %q is missing a bucket name", raw)

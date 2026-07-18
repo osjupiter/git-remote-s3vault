@@ -15,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
 )
 
 // Object is a stored object's metadata.
@@ -48,7 +48,7 @@ type S3Storage struct {
 func New(ctx context.Context, cfg *config.Config) (*S3Storage, error) {
 	if cfg.AccessKeyID == "" || cfg.SecretAccessKey == "" {
 		return nil, fmt.Errorf("no S3 credentials configured for bucket %q; "+
-			"run `git-remote-s3ee setup`, or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY", cfg.Bucket)
+			"run `git-remote-s3vault setup`, or set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY", cfg.Bucket)
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(cfg.Region),

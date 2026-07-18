@@ -35,11 +35,11 @@ import (
 
 	"filippo.io/age"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/config"
-	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
-	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
-	"github.com/osjupiter/git-remote-s3ee/internal/kopiax"
-	"github.com/osjupiter/git-remote-s3ee/internal/storage"
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3vault/internal/keyring"
+	"github.com/osjupiter/git-remote-s3vault/internal/kopiax"
+	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
 const stagedDEKName = ".keys/rotation-next.age"

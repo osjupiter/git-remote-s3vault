@@ -25,12 +25,12 @@ func TestParseURL(t *testing.T) {
 		prefix  string
 		wantErr bool
 	}{
-		{"s3ee://my-bucket/team/repo", "my-bucket", "team/repo", false},
-		{"s3ee://my-bucket", "my-bucket", "", false},
-		{"s3ee://my-bucket/", "my-bucket", "", false},
+		{"s3vault://my-bucket/team/repo", "my-bucket", "team/repo", false},
+		{"s3vault://my-bucket", "my-bucket", "", false},
+		{"s3vault://my-bucket/", "my-bucket", "", false},
 		{"s3://other/deep/nested/path/", "other", "deep/nested/path", false},
 		{"https://example.com/x", "", "", true},
-		{"s3ee:///no-bucket", "", "", true},
+		{"s3vault:///no-bucket", "", "", true},
 	}
 	for _, tc := range cases {
 		c, err := load("origin", tc.url, fakeGit{}, env(nil), nil)
@@ -67,8 +67,8 @@ func TestEndpointAndPathStyleHeuristic(t *testing.T) {
 
 	// R2 and AWS endpoints → virtual-hosted style.
 	for _, ep := range []string{"https://abc.r2.cloudflarestorage.com", "https://s3.eu-central-1.amazonaws.com", ""} {
-		c, err := load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
-			"GIT_REMOTE_S3EE_ENDPOINT": ep,
+		c, err := load("origin", "s3vault://b", fakeGit{}, env(map[string]string{
+			"GIT_REMOTE_S3VAULT_ENDPOINT": ep,
 		}), nil)
 		if err != nil {
 			t.Fatal(err)
@@ -79,7 +79,7 @@ func TestEndpointAndPathStyleHeuristic(t *testing.T) {
 	}
 
 	// Default region.
-	c, err = load("origin", "s3ee://b", fakeGit{}, env(nil), nil)
+	c, err = load("origin", "s3vault://b", fakeGit{}, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,11 +91,11 @@ func TestEndpointAndPathStyleHeuristic(t *testing.T) {
 func TestGitConfigPrecedence(t *testing.T) {
 	git := fakeGit{
 		"remote.origin.endpoint":   {"https://remote-scoped.example.com"},
-		"s3ee.endpoint":            {"https://global.example.com"},
-		"s3ee.agerecipients":       {"age1aaa", "age1bbb"},
+		"s3vault.endpoint":         {"https://global.example.com"},
+		"s3vault.agerecipients":    {"age1aaa", "age1bbb"},
 		"remote.origin.encryption": {"none"},
 	}
-	c, err := load("origin", "s3ee://b", git, env(nil), nil)
+	c, err := load("origin", "s3vault://b", git, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestGitConfigPrecedence(t *testing.T) {
 	}
 
 	// Env beats git config.
-	c, err = load("origin", "s3ee://b", git, env(map[string]string{"GIT_REMOTE_S3EE_ENDPOINT": "https://from-env.example.com"}), nil)
+	c, err = load("origin", "s3vault://b", git, env(map[string]string{"GIT_REMOTE_S3VAULT_ENDPOINT": "https://from-env.example.com"}), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,8 +128,8 @@ func TestSavedCredentialsResolution(t *testing.T) {
 	}
 
 	// Env is empty → saved credentials fill in.
-	c, err := load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
-		"GIT_REMOTE_S3EE_ENDPOINT": "https://ep1.example.com",
+	c, err := load("origin", "s3vault://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3VAULT_ENDPOINT": "https://ep1.example.com",
 	}), stored)
 	if err != nil {
 		t.Fatal(err)
@@ -139,10 +139,10 @@ func TestSavedCredentialsResolution(t *testing.T) {
 	}
 
 	// Env credentials win over the store.
-	c, err = load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
-		"GIT_REMOTE_S3EE_ENDPOINT": "https://ep1.example.com",
-		"AWS_ACCESS_KEY_ID":        "env-key",
-		"AWS_SECRET_ACCESS_KEY":    "env-secret",
+	c, err = load("origin", "s3vault://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3VAULT_ENDPOINT": "https://ep1.example.com",
+		"AWS_ACCESS_KEY_ID":           "env-key",
+		"AWS_SECRET_ACCESS_KEY":       "env-secret",
 	}), stored)
 	if err != nil {
 		t.Fatal(err)
@@ -153,8 +153,8 @@ func TestSavedCredentialsResolution(t *testing.T) {
 
 	// No match in the store → left empty (storage.New then rejects the
 	// connection with guidance; there is no AWS-chain fallback).
-	c, err = load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
-		"GIT_REMOTE_S3EE_ENDPOINT": "https://unknown.example.com",
+	c, err = load("origin", "s3vault://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3VAULT_ENDPOINT": "https://unknown.example.com",
 	}), stored)
 	if err != nil {
 		t.Fatal(err)
@@ -165,15 +165,15 @@ func TestSavedCredentialsResolution(t *testing.T) {
 }
 
 func TestEncryptionDefaultsToAge(t *testing.T) {
-	c, err := load("origin", "s3ee://b", fakeGit{}, env(nil), nil)
+	c, err := load("origin", "s3vault://b", fakeGit{}, env(nil), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.Encryption != EncryptionAge {
 		t.Errorf("encryption = %q, want age by default", c.Encryption)
 	}
-	if _, err := load("origin", "s3ee://b", fakeGit{}, env(map[string]string{
-		"GIT_REMOTE_S3EE_ENCRYPTION": "rot13",
+	if _, err := load("origin", "s3vault://b", fakeGit{}, env(map[string]string{
+		"GIT_REMOTE_S3VAULT_ENCRYPTION": "rot13",
 	}), nil); err == nil {
 		t.Error("invalid encryption mode should be rejected")
 	}

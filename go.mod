@@ -1,4 +1,4 @@
-module github.com/osjupiter/git-remote-s3ee
+module github.com/osjupiter/git-remote-s3vault
 
 go 1.26.4
 

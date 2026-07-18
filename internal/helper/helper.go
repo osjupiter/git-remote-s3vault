@@ -28,12 +28,12 @@ import (
 
 	"filippo.io/age"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/config"
-	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
-	"github.com/osjupiter/git-remote-s3ee/internal/gitutil"
-	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
-	"github.com/osjupiter/git-remote-s3ee/internal/kopiax"
-	"github.com/osjupiter/git-remote-s3ee/internal/storage"
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3vault/internal/gitutil"
+	"github.com/osjupiter/git-remote-s3vault/internal/keyring"
+	"github.com/osjupiter/git-remote-s3vault/internal/kopiax"
+	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
 // errEmptyRemote marks a remote that has never been pushed to (no keyring,
@@ -138,13 +138,13 @@ func (h *Helper) printf(format string, args ...any) {
 }
 
 func (h *Helper) logf(format string, args ...any) {
-	if h.verbose >= 2 || os.Getenv("GIT_REMOTE_S3EE_DEBUG") != "" {
-		fmt.Fprintf(h.errW, "git-remote-s3ee: "+format+"\n", args...)
+	if h.verbose >= 2 || os.Getenv("GIT_REMOTE_S3VAULT_DEBUG") != "" {
+		fmt.Fprintf(h.errW, "git-remote-s3vault: "+format+"\n", args...)
 	}
 }
 
 func (h *Helper) warnf(format string, args ...any) {
-	fmt.Fprintf(h.errW, "git-remote-s3ee: warning: "+format+"\n", args...)
+	fmt.Fprintf(h.errW, "git-remote-s3vault: warning: "+format+"\n", args...)
 }
 
 // progressf narrates the slow parts (bundling, uploading, downloading) on
@@ -154,7 +154,7 @@ func (h *Helper) progressf(format string, args ...any) {
 	if !h.progress || h.verbose < 1 {
 		return
 	}
-	fmt.Fprintf(h.errW, "git-remote-s3ee: "+format+"\n", args...)
+	fmt.Fprintf(h.errW, "git-remote-s3vault: "+format+"\n", args...)
 }
 
 func humanSize(n int64) string {
@@ -253,7 +253,7 @@ func (h *Helper) repoPassword(ctx context.Context, create bool) (string, error) 
 			return "", err
 		}
 		h.warnf("initialized repository key; access granted to %d public key(s)", len(specs))
-		h.warnf("no recovery key was created; run `git-remote-s3ee key recovery-init` to add one")
+		h.warnf("no recovery key was created; run `git-remote-s3vault key recovery-init` to add one")
 		h.password = dek.String()
 		return h.password, nil
 	}
@@ -277,8 +277,8 @@ func (h *Helper) repoPassword(ctx context.Context, create bool) (string, error) 
 			}
 		}
 		return "", fmt.Errorf("none of your keys can unwrap the repository key; " +
-			"ask a member to run `git-remote-s3ee key grant <your-public-key>` " +
-			"or recover with `git-remote-s3ee key recover`")
+			"ask a member to run `git-remote-s3vault key grant <your-public-key>` " +
+			"or recover with `git-remote-s3vault key recover`")
 	}
 	h.password = dek.String()
 	return h.password, nil
@@ -420,7 +420,7 @@ func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
 	defer body.Close()
 	h.progressf("downloading %s (%s)", name, humanSize(size))
 
-	tmp, err := gitutil.TempFile("git-remote-s3ee-fetch-*.bundle")
+	tmp, err := gitutil.TempFile("git-remote-s3vault-fetch-*.bundle")
 	if err != nil {
 		return err
 	}
@@ -525,7 +525,7 @@ func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error
 	// against everything already stored happens inside kopia, so only the
 	// changed chunks are actually uploaded.
 	h.progressf("bundling %s (full history)", dst)
-	tmp, err := gitutil.TempFile("git-remote-s3ee-push-*.bundle")
+	tmp, err := gitutil.TempFile("git-remote-s3vault-push-*.bundle")
 	if err != nil {
 		return err
 	}
@@ -593,7 +593,7 @@ func defaultConfigPath(name string) string {
 	if err != nil {
 		return ""
 	}
-	p := path.Join(dir, "git-remote-s3ee", name)
+	p := path.Join(dir, "git-remote-s3vault", name)
 	if _, err := os.Stat(p); err != nil {
 		return ""
 	}
@@ -631,7 +631,7 @@ func (h *Helper) initialRecipientSpecs() ([]string, error) {
 	}
 	if len(specs) == 0 {
 		return nil, fmt.Errorf("cannot initialize the repository key: no public keys available; " +
-			"run `git-remote-s3ee setup`, set r2.ageRecipients, or opt out with r2.encryption=none")
+			"run `git-remote-s3vault setup`, set r2.ageRecipients, or opt out with r2.encryption=none")
 	}
 	if _, err := cryptox.ParseRecipients(specs); err != nil {
 		return nil, err
@@ -651,7 +651,7 @@ func (h *Helper) loadIdentities() ([]age.Identity, error) {
 	}
 	if len(files) == 0 {
 		return nil, fmt.Errorf("the remote is encrypted but no machine key is configured; " +
-			"set r2.ageIdentityFile (git config) or GIT_REMOTE_S3EE_AGE_IDENTITY_FILE")
+			"set r2.ageIdentityFile (git config) or GIT_REMOTE_S3VAULT_AGE_IDENTITY_FILE")
 	}
 	ids, err := cryptox.LoadIdentityFiles(files)
 	if err != nil {

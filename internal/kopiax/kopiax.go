@@ -37,8 +37,8 @@ import (
 	"github.com/kopia/kopia/repo/manifest"
 	"github.com/kopia/kopia/repo/object"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/config"
-	"github.com/osjupiter/git-remote-s3ee/internal/storage"
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
 // ErrNotInitialized is returned when the remote has no kopia repository
@@ -48,7 +48,7 @@ var ErrNotInitialized = errors.New("remote repository not initialized")
 // PlaintextPassword is the well-known password used when the user
 // explicitly opts out of encryption (r2.encryption=none). It is NOT a
 // secret and provides no confidentiality.
-const PlaintextPassword = "git-remote-s3ee-plaintext-mode"
+const PlaintextPassword = "git-remote-s3vault-plaintext-mode"
 
 // NewBlobStorage builds the kopia blob storage for one data generation of
 // a remote. Tests swap this out for a filesystem-backed store.
@@ -183,7 +183,7 @@ func Open(ctx context.Context, cfg *config.Config, password, gen string, create 
 		hostname = "localhost"
 	}
 	if err := repo.Connect(ctx, configFile, st, password, &repo.ConnectOptions{
-		ClientOptions: repo.ClientOptions{Username: "git-remote-s3ee", Hostname: hostname},
+		ClientOptions: repo.ClientOptions{Username: "git-remote-s3vault", Hostname: hostname},
 		CachingOptions: content.CachingOptions{
 			CacheDirectory:         filepath.Join(cacheDir, "cache"),
 			ContentCacheSizeBytes:  512 << 20,
@@ -199,7 +199,7 @@ func Open(ctx context.Context, cfg *config.Config, password, gen string, create 
 
 	rep, err := repo.Open(ctx, configFile, password, nil)
 	if err != nil {
-		return nil, fmt.Errorf("opening repository (wrong key? see `git-remote-s3ee key list`): %w", err)
+		return nil, fmt.Errorf("opening repository (wrong key? see `git-remote-s3vault key list`): %w", err)
 	}
 	return &Repo{rep: rep}, nil
 }
@@ -212,7 +212,7 @@ func cachePaths(cfg *config.Config, gen string) (string, string, error) {
 		return "", "", fmt.Errorf("resolving cache dir: %w", err)
 	}
 	sum := sha256.Sum256([]byte(cfg.Endpoint + "\x00" + cfg.Bucket + "\x00" + cfg.Prefix + "\x00" + gen))
-	dir := filepath.Join(base, "git-remote-s3ee", hex.EncodeToString(sum[:])[:16])
+	dir := filepath.Join(base, "git-remote-s3vault", hex.EncodeToString(sum[:])[:16])
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
 	}
@@ -277,7 +277,7 @@ func (r *Repo) Head(ctx context.Context) (string, error) {
 // setting HEAD, in one write session. It returns the bundle's object ID.
 func (r *Repo) PushRef(ctx context.Context, name, sha string, bundle io.Reader, setHead bool) (string, error) {
 	var oidStr string
-	err := repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3ee push"},
+	err := repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3vault push"},
 		func(ctx context.Context, w repo.RepositoryWriter) error {
 			ow := w.NewObjectWriter(ctx, object.WriterOptions{Description: "git bundle " + name})
 			defer ow.Close() //nolint:errcheck // Result() surfaces errors
@@ -304,7 +304,7 @@ func (r *Repo) PushRef(ctx context.Context, name, sha string, bundle io.Reader, 
 
 // SetHead points the remote HEAD at the given refname.
 func (r *Repo) SetHead(ctx context.Context, target string) error {
-	return repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3ee head"},
+	return repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3vault head"},
 		func(ctx context.Context, w repo.RepositoryWriter) error {
 			_, err := w.ReplaceManifests(ctx, headLabels(), headPayload{Target: target})
 			return err
@@ -329,7 +329,7 @@ func (r *Repo) deleteManifests(ctx context.Context, labels map[string]string) er
 	if len(entries) == 0 {
 		return nil
 	}
-	return repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3ee delete"},
+	return repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3vault delete"},
 		func(ctx context.Context, w repo.RepositoryWriter) error {
 			for _, e := range entries {
 				if err := w.DeleteManifest(ctx, e.ID); err != nil {

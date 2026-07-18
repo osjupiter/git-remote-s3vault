@@ -16,7 +16,7 @@ import (
 	"filippo.io/age"
 	"golang.org/x/crypto/ssh"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
+	"github.com/osjupiter/git-remote-s3vault/internal/credstore"
 )
 
 func gitOut(t *testing.T, args ...string) (string, error) {
@@ -53,12 +53,12 @@ func runWithInput(t *testing.T, input string, args ...string) (string, error) {
 
 func TestSetupFreshRepo(t *testing.T) {
 	setupRepo(t)
-	out, err := run(t, "--no-verify", "s3ee://bucket/proj")
+	out, err := run(t, "--no-verify", "s3vault://bucket/proj")
 	if err != nil {
 		t.Fatalf("setup failed: %v\n%s", err, out)
 	}
 
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://bucket/proj" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3vault://bucket/proj" {
 		t.Errorf("remote url = %q", url)
 	}
 	recips, _ := gitOut(t, "config", "--get-all", "remote.origin.agerecipients")
@@ -67,7 +67,7 @@ func TestSetupFreshRepo(t *testing.T) {
 	}
 
 	// A fresh identity was generated at the default location with 0600.
-	idPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-s3ee", "identity.txt")
+	idPath := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-s3vault", "identity.txt")
 	st, err := os.Stat(idPath)
 	if err != nil {
 		t.Fatalf("identity not generated: %v", err)
@@ -82,11 +82,11 @@ func TestSetupFreshRepo(t *testing.T) {
 
 func TestSetupIsIdempotent(t *testing.T) {
 	setupRepo(t)
-	if _, err := run(t, "--no-verify", "s3ee://bucket/proj"); err != nil {
+	if _, err := run(t, "--no-verify", "s3vault://bucket/proj"); err != nil {
 		t.Fatal(err)
 	}
 	out, err := run(t, "--no-verify", "--recipient",
-		"age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p", "s3ee://bucket/proj")
+		"age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p", "s3vault://bucket/proj")
 	if err != nil {
 		t.Fatalf("second setup failed: %v\n%s", err, out)
 	}
@@ -108,11 +108,11 @@ func TestSetupIsIdempotent(t *testing.T) {
 func TestSetupUpdatesExistingRemote(t *testing.T) {
 	setupRepo(t)
 	gitOut(t, "remote", "add", "origin", "https://example.com/old.git")
-	out, err := run(t, "--no-verify", "--endpoint", "https://ep.example.com", "s3ee://bucket/new-home")
+	out, err := run(t, "--no-verify", "--endpoint", "https://ep.example.com", "s3vault://bucket/new-home")
 	if err != nil {
 		t.Fatalf("setup failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://bucket/new-home" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3vault://bucket/new-home" {
 		t.Errorf("remote url not updated: %q", url)
 	}
 	if v, _ := gitOut(t, "config", "remote.origin.endpoint"); v != "https://ep.example.com" {
@@ -122,7 +122,7 @@ func TestSetupUpdatesExistingRemote(t *testing.T) {
 
 func TestSetupEncryptionNone(t *testing.T) {
 	setupRepo(t)
-	out, err := run(t, "--no-verify", "--encryption", "none", "s3ee://bucket/plain")
+	out, err := run(t, "--no-verify", "--encryption", "none", "s3vault://bucket/plain")
 	if err != nil {
 		t.Fatalf("setup failed: %v\n%s", err, out)
 	}
@@ -146,7 +146,7 @@ func TestWizardBuildsURLFromAnswers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://my-bucket/my-prefix" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3vault://my-bucket/my-prefix" {
 		t.Errorf("remote url = %q", url)
 	}
 	if v, _ := gitOut(t, "config", "remote.origin.endpoint"); v != "https://ep.example.com" {
@@ -173,7 +173,7 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 		t.Errorf("credential questions should be skipped with env creds:\n%s", out)
 	}
 	top, _ := gitOut(t, "rev-parse", "--show-toplevel")
-	wantURL := "s3ee://bkt/" + filepath.Base(top)
+	wantURL := "s3vault://bkt/" + filepath.Base(top)
 	if url, _ := gitOut(t, "remote", "get-url", "upstream"); url != wantURL {
 		t.Errorf("remote url = %q, want %q", url, wantURL)
 	}
@@ -184,12 +184,12 @@ func TestWizardDefaultsAndEndpointBackend(t *testing.T) {
 
 func TestWizardReusesExistingRemote(t *testing.T) {
 	setupRepo(t)
-	gitOut(t, "remote", "add", "origin", "s3ee://old-bucket/old-prefix")
+	gitOut(t, "remote", "add", "origin", "s3vault://old-bucket/old-prefix")
 	out, err := runWithInput(t, "\n", "--no-verify") // Enter = "Y", use it
 	if err != nil {
 		t.Fatalf("wizard setup failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://old-bucket/old-prefix" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3vault://old-bucket/old-prefix" {
 		t.Errorf("remote url = %q", url)
 	}
 }
@@ -250,7 +250,7 @@ func TestWizardStripsPasteArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wizard failed: %v\n%s", err, out)
 	}
-	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3ee://my-bucket/my-prefix" {
+	if url, _ := gitOut(t, "remote", "get-url", "origin"); url != "s3vault://my-bucket/my-prefix" {
 		t.Errorf("paste artifacts leaked into the config: url=%q", url)
 	}
 }
@@ -269,7 +269,7 @@ func seedMachineKeys(t *testing.T) []string {
 		recips = append(recips, id.Recipient().String())
 		fmt.Fprintf(&content, "%s\n", id)
 	}
-	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-s3ee")
+	dir := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "git-remote-s3vault")
 	os.MkdirAll(dir, 0o700)
 	if err := os.WriteFile(filepath.Join(dir, "identity.txt"), []byte(content.String()), 0o600); err != nil {
 		t.Fatal(err)
@@ -387,7 +387,7 @@ func TestCloneRejectsBadInput(t *testing.T) {
 	if err := runClone("https://github.com/x/y.git"); err == nil {
 		t.Error("clone with a non-r2 URL must fail")
 	}
-	if err := runClone("s3ee://b/p", "dir", "extra"); err == nil {
+	if err := runClone("s3vault://b/p", "dir", "extra"); err == nil {
 		t.Error("clone with too many args must fail")
 	}
 }
@@ -401,7 +401,7 @@ func TestCloneWizardCollectsAnswers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("wizard: %v\n%s", err, out.String())
 	}
-	if a.rawURL != "s3ee://bkt/team/proj" || a.endpoint != "https://ep.example.com" || a.dir != "proj" {
+	if a.rawURL != "s3vault://bkt/team/proj" || a.endpoint != "https://ep.example.com" || a.dir != "proj" {
 		t.Errorf("answers = %+v", a)
 	}
 	// Credentials were saved for the bucket after the confirmation.
@@ -425,10 +425,10 @@ func TestCloneWizardAbortSavesNothing(t *testing.T) {
 
 func TestDeriveCloneDir(t *testing.T) {
 	cases := map[string]string{
-		"s3ee://bucket/team/project": "project",
-		"s3ee://bucket/repo.git":     "repo",
-		"s3ee://bucket":              "bucket",
-		"s3ee://bucket/":             "bucket",
+		"s3vault://bucket/team/project": "project",
+		"s3vault://bucket/repo.git":     "repo",
+		"s3vault://bucket":              "bucket",
+		"s3vault://bucket/":             "bucket",
 	}
 	for url, want := range cases {
 		if got := deriveCloneDir(url); got != want {
@@ -445,13 +445,13 @@ func TestSetupRejectsBadInput(t *testing.T) {
 	if _, err := run(t, "--no-verify"); err == nil {
 		t.Error("missing URL should be rejected")
 	}
-	if _, err := run(t, "--no-verify", "--encryption", "rot13", "s3ee://b/p"); err == nil {
+	if _, err := run(t, "--no-verify", "--encryption", "rot13", "s3vault://b/p"); err == nil {
 		t.Error("bad encryption mode should be rejected")
 	}
 
 	// Outside a git repository.
 	t.Chdir(t.TempDir())
-	if _, err := run(t, "--no-verify", "s3ee://bucket/proj"); err == nil {
+	if _, err := run(t, "--no-verify", "s3vault://bucket/proj"); err == nil {
 		t.Error("setup outside a git repo should fail")
 	}
 }

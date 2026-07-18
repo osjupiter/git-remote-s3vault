@@ -1,5 +1,5 @@
 // Package credstore is the on-disk store for S3 credentials at
-// ~/.config/git-remote-s3ee/credentials.
+// ~/.config/git-remote-s3vault/credentials.
 //
 // The file is plaintext with 0600 permissions — the same trust model as
 // standard credential files. The expected setup is one bucket-scoped API
@@ -34,7 +34,7 @@ func Path() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve user config dir: %w", err)
 	}
-	return filepath.Join(dir, "git-remote-s3ee", "credentials"), nil
+	return filepath.Join(dir, "git-remote-s3vault", "credentials"), nil
 }
 
 // SectionKey derives the storage key for a bucket, qualified by endpoint
@@ -108,7 +108,7 @@ func Save(endpoint, bucket string, c Credentials) (string, string, error) {
 		return "", "", err
 	}
 	var b strings.Builder
-	b.WriteString("# git-remote-s3ee credentials. Keep permissions at 0600.\n")
+	b.WriteString("# git-remote-s3vault credentials. Keep permissions at 0600.\n")
 	b.WriteString("# Tip: use R2 API tokens scoped to a single bucket (Object Read & Write).\n")
 	for _, s := range sections.list {
 		fmt.Fprintf(&b, "\n[%s]\n", s.name)

@@ -84,7 +84,7 @@ func TestEndpointNormalizationAndAWSEntries(t *testing.T) {
 
 func TestNoCrossEntryFallback(t *testing.T) {
 	dir := isolate(t)
-	path := filepath.Join(dir, "git-remote-s3ee", "credentials")
+	path := filepath.Join(dir, "git-remote-s3vault", "credentials")
 	os.MkdirAll(filepath.Dir(path), 0o700)
 	os.WriteFile(path, []byte(
 		"[endpoint:http://127.0.0.1:9000]\naccess_key_id = wide\nsecret_access_key = s\n"), 0o600)
@@ -120,7 +120,7 @@ func TestUpsertPreservesOtherSections(t *testing.T) {
 
 func TestFixesLoosePermissions(t *testing.T) {
 	dir := isolate(t)
-	path := filepath.Join(dir, "git-remote-s3ee", "credentials")
+	path := filepath.Join(dir, "git-remote-s3vault", "credentials")
 	os.MkdirAll(filepath.Dir(path), 0o700)
 	os.WriteFile(path, []byte("[bucket:x]\naccess_key_id = k\nsecret_access_key = s\n"), 0o644)
 

@@ -12,14 +12,14 @@ import (
 	"path"
 	"strings"
 
-	"github.com/osjupiter/git-remote-s3ee/internal/config"
-	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
-	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
-	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
-	"github.com/osjupiter/git-remote-s3ee/internal/storage"
+	"github.com/osjupiter/git-remote-s3vault/internal/config"
+	"github.com/osjupiter/git-remote-s3vault/internal/credstore"
+	"github.com/osjupiter/git-remote-s3vault/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3vault/internal/keyring"
+	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
-// RunClone implements `git-remote-s3ee clone [url] [dir]`: the onboarding
+// RunClone implements `git-remote-s3vault clone [url] [dir]`: the onboarding
 // path for a second machine or a teammate. With no URL an interactive
 // wizard (same style as setup) asks for the endpoint, credentials, bucket,
 // and target directory. It prepares everything a plain `git clone` would
@@ -27,12 +27,12 @@ import (
 // step is missing, then runs git clone and persists the backend settings
 // into the fresh repository.
 func RunClone(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	fs := flag.NewFlagSet("git-remote-s3ee clone", flag.ContinueOnError)
+	fs := flag.NewFlagSet("git-remote-s3vault clone", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	endpoint := fs.String("endpoint", "", "explicit S3 endpoint URL (MinIO, AWS, ...)")
-	identityPath := fs.String("identity", "", "machine key file (default: ~/.config/git-remote-s3ee/identity.txt, generated if missing)")
+	identityPath := fs.String("identity", "", "machine key file (default: ~/.config/git-remote-s3vault/identity.txt, generated if missing)")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: git-remote-s3ee clone [s3ee://bucket/prefix] [directory] [flags]\n")
+		fmt.Fprintf(stderr, "usage: git-remote-s3vault clone [s3vault://bucket/prefix] [directory] [flags]\n")
 		fmt.Fprintf(stderr, "(with no URL, an interactive wizard asks for everything)\n\n")
 		fs.PrintDefaults()
 	}
@@ -64,10 +64,10 @@ func RunClone(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 	// Flags become env vars so both config.Load here and the helper spawned
 	// by git clone resolve the same backend.
 	if *endpoint != "" {
-		os.Setenv("GIT_REMOTE_S3EE_ENDPOINT", *endpoint)
+		os.Setenv("GIT_REMOTE_S3VAULT_ENDPOINT", *endpoint)
 	}
 	if *identityPath != "" {
-		os.Setenv("GIT_REMOTE_S3EE_AGE_IDENTITY_FILE", *identityPath)
+		os.Setenv("GIT_REMOTE_S3VAULT_AGE_IDENTITY_FILE", *identityPath)
 	}
 
 	// 1. Machine key.
@@ -116,9 +116,9 @@ func RunClone(ctx context.Context, args []string, stdin io.Reader, stdout, stder
 			fmt.Fprintf(stdout, "✗ this machine's key has no access to the repository yet.\n\n")
 			for _, r := range recips {
 				fmt.Fprintf(stdout, "  Your public key:\n    %s\n\n", r)
-				fmt.Fprintf(stdout, "  Ask a member to run:\n    git-remote-s3ee key grant %s %s\n\n", r, rawURL)
+				fmt.Fprintf(stdout, "  Ask a member to run:\n    git-remote-s3vault key grant %s %s\n\n", r, rawURL)
 			}
-			fmt.Fprintf(stdout, "  Or, if you hold the recovery key:\n    git-remote-s3ee key recover %s\n", rawURL)
+			fmt.Fprintf(stdout, "  Or, if you hold the recovery key:\n    git-remote-s3vault key recover %s\n", rawURL)
 			return fmt.Errorf("access not granted yet; re-run clone afterwards")
 		}
 		fmt.Fprintf(stdout, "✓ access confirmed\n")
@@ -195,7 +195,7 @@ func runCloneWizard(stdin io.Reader, stdout io.Writer, endpointFlag string) (*cl
 	if err != nil {
 		return nil, err
 	}
-	a.rawURL = "s3ee://" + bucket
+	a.rawURL = "s3vault://" + bucket
 	if p := strings.Trim(prefix, "/"); p != "" {
 		a.rawURL += "/" + p
 	}
