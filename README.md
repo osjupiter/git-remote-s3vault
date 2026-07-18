@@ -26,11 +26,15 @@ $ git clone s3vault://my-bucket/my-repo
 
 - **Single static binary.** Written in Go — no Python, no pip, no runtime.
   Drop `git-remote-s3vault` on your `PATH` and git finds it.
-- **Encrypted before it leaves your machine.** Everything is encrypted
-  client-side, by default, always; keys are managed sops-style with
+- **Encrypted before it leaves your machine — not just SSE.**
+  git-remote-s3 relies on S3 server-side encryption, where the provider
+  performs the decryption: anyone with `s3:GetObject` (+ `kms:Decrypt`)
+  reads plaintext. Here everything is encrypted client-side, by default,
+  always; keys are managed sops-style with
   [age](https://age-encryption.org) (grant a teammate with one command, a
   printed recovery key restores access from nothing). The storage provider
-  sees only opaque ciphertext — not even branch names.
+  sees only opaque ciphertext — not even branch names — and bucket
+  credentials alone yield nothing readable.
 - **Deduplicated.** Data rides on [kopia](https://kopia.io)'s
   content-defined chunking: pushes upload only changed chunks, and tags or
   branches sharing history cost almost nothing.
