@@ -739,8 +739,7 @@ func (h *Helper) pushSnapshot(ctx context.Context, newRefs map[string]string, he
 // buildSnapshotBundle produces one bundle containing the full history of
 // every ref in newRefs. Fast path: everything is in the local odb. Slow
 // path (refs exist remotely that this clone never fetched): merge the
-// remote's current objects with the pushed refs in a scratch bare repo,
-// mattn/git-remote-s3 style.
+// remote's current objects with the pushed refs in a scratch bare repo.
 func (h *Helper) buildSnapshotBundle(ctx context.Context, newRefs map[string]string, bundlePath string) error {
 	shas := make([]string, 0, len(newRefs))
 	haveAll := true

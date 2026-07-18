@@ -108,9 +108,8 @@ func (g Git) GitDir() (string, error) {
 }
 
 // Scratch is a temporary bare repository used to merge the remote's
-// current snapshot with locally pushed refs before bundling (mattn's
-// git-remote-s3 technique) — it guarantees refs absent from the local
-// clone survive a push untouched.
+// current snapshot with locally pushed refs before bundling — it
+// guarantees refs absent from the local clone survive a push untouched.
 type Scratch struct {
 	Dir string
 }

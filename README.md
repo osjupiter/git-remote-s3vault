@@ -398,8 +398,7 @@ flowchart LR
 
 - Branches and tags cost almost nothing: shared history is stored once.
 - Clone/fetch downloads and unbundles **one bundle total**, no matter
-  how many branches and tags exist (the snapshot model of
-  [mattn/git-remote-s3](https://github.com/mattn/git-remote-s3)).
+  how many branches and tags exist.
 - A multi-ref push (`git push --all`, atomic pushes) lands as one
   atomic state swap; **concurrent pushes cannot interleave per ref** —
   the loser gets "concurrent push detected; fetch and retry".
