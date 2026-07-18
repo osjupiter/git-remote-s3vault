@@ -1,15 +1,26 @@
 name: Release
 
-# Fires when a version tag is pushed — including the tag GitHub creates
-# when you make a new release in the web UI. goreleaser then builds the
-# binaries (linux/darwin amd64+arm64, windows amd64) and attaches them to
-# the release, keeping any notes you wrote by hand.
+# Two triggers so both flows work:
+#  - pushing a tag with git (`git tag v1.2.3 && git push origin v1.2.3`)
+#  - creating a release in the GitHub UI / via `gh release create`
+#    (API-created tags do not reliably fire push events, so the release
+#    event is required for this path)
+# goreleaser builds the binaries (linux/darwin amd64+arm64, windows
+# amd64) and attaches them, keeping hand-written release notes
+# (release.mode: keep-existing). The concurrency group prevents duplicate
+# runs when both events fire for the same tag.
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   goreleaser:
