@@ -31,6 +31,8 @@ func TestParseURL(t *testing.T) {
 		{"s3://other/deep/nested/path/", "other", "deep/nested/path", false},
 		{"https://example.com/x", "", "", true},
 		{"s3vault:///no-bucket", "", "", true},
+		{"r2://old/scheme", "", "", true},
+		{"s3ee://old/scheme", "", "", true},
 	}
 	for _, tc := range cases {
 		c, err := load("origin", tc.url, fakeGit{}, env(nil), nil)

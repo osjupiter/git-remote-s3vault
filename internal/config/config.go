@@ -214,6 +214,10 @@ func (c *Config) parseURL(raw string) error {
 	}
 	switch u.Scheme {
 	case "s3vault", "s3":
+	case "r2", "s3ee":
+		// Schemes from before the project was renamed to s3vault.
+		return fmt.Errorf("%q is this tool's old URL scheme; update the remote:\n"+
+			"  git remote set-url origin s3vault://%s%s", u.Scheme, u.Host, u.Path)
 	default:
 		return fmt.Errorf("unsupported URL scheme %q (want s3vault:// or s3://)", u.Scheme)
 	}
