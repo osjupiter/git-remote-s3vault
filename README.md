@@ -318,6 +318,26 @@ is O(1): wrap the DEK for one more key and the entire existing history
 becomes readable instantly, with no re-encryption and no re-push. Repos
 stay isolated — one machine key serves every repo without coupling them.
 
+```mermaid
+flowchart LR
+    subgraph yours["Your side (secrets never leave it)"]
+        A["Alice's machine key"]
+        B["Bob's machine key"]
+        R["Recovery secret<br/>(password manager / paper)"]
+    end
+    subgraph keys["Bucket: .keys/ (wrapped copies of the DEK)"]
+        WA["DEK wrapped<br/>for Alice"]
+        WB["DEK wrapped<br/>for Bob"]
+        WR["DEK wrapped<br/>for recovery"]
+    end
+    DEK["repository key (DEK)"]
+    DATA[("Bucket: data/<br/>encrypted, deduplicated chunks")]
+    A -->|unwraps| WA --> DEK
+    B -->|unwraps| WB --> DEK
+    R -->|unwraps| WR --> DEK
+    DEK -->|"is the kopia password"| DATA
+```
+
 ```console
 $ git-remote-s3vault key grant age1<teammate> ; git-remote-s3vault key list ; git-remote-s3vault key revoke <label>
 ```
@@ -355,6 +375,15 @@ repository password. kopia provides content-defined chunking with
 "full" bundle, only the chunks that actually changed are uploaded and
 stored. Measured in the e2e suite: on a ~3 MB repository, pushing a tag
 adds ~5 KB and a small commit ~300 KB.
+
+```mermaid
+flowchart LR
+    G["git push"] --> BND["full-history bundle<br/>(stream copy on a packed repo)"]
+    BND --> KOP["kopia:<br/>chunk, dedup, encrypt"]
+    KOP -->|"changed chunks only"| BKT[("bucket data/")]
+    BKT -->|"bulk prefetch"| KOP2["kopia:<br/>decrypt from cache"]
+    KOP2 --> UNB["bundle → git unbundle"] --> C["git clone / fetch"]
+```
 
 - Branches and tags cost almost nothing: shared history is stored once.
 - Pushes enforce fast-forward unless `--force` is used (ancestry is
