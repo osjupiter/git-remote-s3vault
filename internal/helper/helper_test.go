@@ -430,6 +430,37 @@ func TestProgressOutput(t *testing.T) {
 	}
 }
 
+// TestLocalCacheHoldsNoPlaintext proves the kopia cache stores ciphertext
+// only: after pushing and fetching known content, no file under the cache
+// root may contain the plaintext. (Decryption happens in memory; the only
+// on-disk plaintext is the transient bundle temp file, removed after use,
+// and of course the working tree itself.)
+func TestLocalCacheHoldsNoPlaintext(t *testing.T) {
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t) // contains "hello r2"
+	sha := git(t, src, "rev-parse", "HEAD")
+	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+
+	// Fetch too, so the read path (prefetch into cache) also runs.
+	dst := t.TempDir()
+	git(t, dst, "init", "-q", "-b", "main")
+	e.runSession(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha))
+
+	cacheRoot := os.Getenv("XDG_CACHE_HOME")
+	found := ""
+	filepath.Walk(cacheRoot, func(p string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			if data, rerr := os.ReadFile(p); rerr == nil && bytes.Contains(data, []byte("hello r2")) {
+				found = p
+			}
+		}
+		return nil
+	})
+	if found != "" {
+		t.Fatalf("plaintext found in local cache file %s", found)
+	}
+}
+
 func TestGCSuggestion(t *testing.T) {
 	e := newTestEnv(t)
 	src := newRepoWithCommit(t)
