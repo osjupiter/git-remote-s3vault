@@ -96,7 +96,7 @@ func TestGrantListRevokeCLI(t *testing.T) {
 		t.Errorf("grant output:\n%s", out)
 	}
 
-	out, err = run(t, "list", "s3vault://bucket/proj")
+	out, err = run(t, "list")
 	if err != nil {
 		t.Fatalf("list: %v\n%s", err, out)
 	}
@@ -104,10 +104,10 @@ func TestGrantListRevokeCLI(t *testing.T) {
 		t.Errorf("list output:\n%s", out)
 	}
 
-	if out, err = run(t, "revoke", "bob", "s3vault://bucket/proj"); err != nil {
+	if out, err = run(t, "revoke", "bob"); err != nil {
 		t.Fatalf("revoke: %v\n%s", err, out)
 	}
-	out, _ = run(t, "list", "s3vault://bucket/proj")
+	out, _ = run(t, "list")
 	if !strings.Contains(out, "1 key slot(s)") {
 		t.Errorf("bob's slot should be gone:\n%s", out)
 	}
@@ -132,8 +132,9 @@ func TestGrantRequiresAccess(t *testing.T) {
 func TestRecoveryInitAndRecover(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
+	inRepoWithRemote(t)
 
-	out, err := run(t, "recovery-init", "--identity", idPath, "s3vault://bucket/proj")
+	out, err := run(t, "recovery-init", "--identity", idPath)
 	if err != nil {
 		t.Fatalf("recovery-init: %v\n%s", err, out)
 	}
@@ -173,7 +174,8 @@ func TestRecoveryInitAndRecover(t *testing.T) {
 func TestRecoverWithWrongKeyFails(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
-	if _, err := run(t, "recovery-init", "--identity", idPath, "s3vault://bucket/proj"); err != nil {
+	inRepoWithRemote(t)
+	if _, err := run(t, "recovery-init", "--identity", idPath); err != nil {
 		t.Fatal(err)
 	}
 
@@ -193,12 +195,13 @@ func TestRecoverWithWrongKeyFails(t *testing.T) {
 func TestRecoveryInitReplacesOldSecret(t *testing.T) {
 	mem := useMemStore(t)
 	idPath, _ := initKeyring(t, mem)
+	inRepoWithRemote(t)
 
-	out1, err := run(t, "recovery-init", "--identity", idPath, "s3vault://bucket/proj")
+	out1, err := run(t, "recovery-init", "--identity", idPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	out2, err := run(t, "recovery-init", "--identity", idPath, "s3vault://bucket/proj")
+	out2, err := run(t, "recovery-init", "--identity", idPath)
 	if err != nil {
 		t.Fatal(err)
 	}

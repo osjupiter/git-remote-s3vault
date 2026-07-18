@@ -39,13 +39,14 @@ var newStore = func(ctx context.Context, cfg *config.Config) (storage.Storage, e
 // Run executes `key <grant|list|revoke|recovery-init|recover> [args] [flags]`.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	usage := func() {
-		fmt.Fprintln(stderr, "usage: git-remote-s3vault key grant   <pubkey> [flags]              give another key access (run inside the repo)")
-		fmt.Fprintln(stderr, "       git-remote-s3vault key list    [s3vault://bucket/prefix]          show who has access")
-		fmt.Fprintln(stderr, "       git-remote-s3vault key revoke  <label|pubkey> [s3vault://...]     remove a key's access slot")
-		fmt.Fprintln(stderr, "       git-remote-s3vault key recovery-init [s3vault://...] [flags]      (re)create the recovery key")
-		fmt.Fprintln(stderr, "       git-remote-s3vault key recover [s3vault://bucket/prefix] [flags]  regain access with the recovery secret")
-		fmt.Fprintln(stderr, "       git-remote-s3vault key rotate  [s3vault://bucket/prefix] [flags]  re-encrypt everything under a new key")
-		fmt.Fprintln(stderr, "The URL may be omitted inside a repository that already has an s3vault:// remote.")
+		fmt.Fprintln(stderr, "usage: git-remote-s3vault key grant   <pubkey> [flags]        give another key access")
+		fmt.Fprintln(stderr, "       git-remote-s3vault key list                            show who has access")
+		fmt.Fprintln(stderr, "       git-remote-s3vault key revoke  <label|pubkey>          remove a key's access slot")
+		fmt.Fprintln(stderr, "       git-remote-s3vault key recovery-init [flags]           (re)create the recovery key")
+		fmt.Fprintln(stderr, "       git-remote-s3vault key rotate  [flags]                 re-encrypt everything under a new key")
+		fmt.Fprintln(stderr, "       git-remote-s3vault key recover [s3vault://...] [flags] regain access with the recovery secret")
+		fmt.Fprintln(stderr, "All commands run inside your clone of the repository; only `recover` accepts")
+		fmt.Fprintln(stderr, "a URL, because it bootstraps a machine that cannot clone yet.")
 	}
 	if len(args) == 0 {
 		usage()
@@ -69,7 +70,7 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	// grant/revoke take a key argument before the optional URL.
+	// grant/revoke take a key argument first.
 	var target string
 	pos := fs.Args()
 	if sub == "grant" || sub == "revoke" {
@@ -79,11 +80,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 		target, pos = pos[0], pos[1:]
 	}
-	// grant is deliberately repository-scoped: inside the clone, the
-	// remote URL, endpoint, and credentials are all unambiguous. A URL
-	// argument would run without the repo's config and mis-resolve them.
-	if sub == "grant" && len(pos) > 0 {
-		return fmt.Errorf("key grant takes no URL — run it inside your clone of the repository")
+
+	// Every command except recover is deliberately repository-scoped:
+	// inside the clone, the remote URL, endpoint, and credentials are all
+	// unambiguous. A URL argument would run without the repo's config and
+	// mis-resolve them. recover is the bootstrap for a machine that cannot
+	// clone yet, so it may take the URL explicitly.
+	if sub != "recover" && len(pos) > 0 {
+		return fmt.Errorf("key %s takes no URL — run it inside your clone of the repository", sub)
 	}
 	if len(pos) > 1 {
 		return fmt.Errorf("at most one URL argument is allowed")
@@ -97,10 +101,10 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		var err error
 		rawURL, err = remoteURL(*remote)
 		if err != nil {
-			if sub == "grant" {
-				return fmt.Errorf("key grant must run inside a repository with an s3vault remote (none found on %q): %w", *remote, err)
+			if sub == "recover" {
+				return fmt.Errorf("no URL given and none found on remote %q (on a fresh machine, pass the s3vault:// URL explicitly): %w", *remote, err)
 			}
-			return fmt.Errorf("no URL given and none found on remote %q (outside a repo, pass the s3vault:// URL explicitly): %w", *remote, err)
+			return fmt.Errorf("key %s must run inside a repository with an s3vault remote (none found on %q): %w", sub, *remote, err)
 		}
 	}
 	if err := config.ValidateURL(rawURL); err != nil {

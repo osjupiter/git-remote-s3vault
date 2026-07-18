@@ -984,7 +984,7 @@ func TestKeyRotationFlow(t *testing.T) {
 	}
 
 	// Rotate. Runs against the URL from outside any repository.
-	out, err = runBin(t.TempDir(), aliceEnv, "key", "rotate", "--yes", remoteURL)
+	out, err = runBin(repo, aliceEnv, "key", "rotate", "--yes")
 	if err != nil {
 		t.Fatalf("rotate: %v\n%s", err, out)
 	}
