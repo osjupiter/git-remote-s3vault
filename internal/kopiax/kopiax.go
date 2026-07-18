@@ -285,11 +285,21 @@ func (r *Repo) deleteManifests(ctx context.Context, labels map[string]string) er
 }
 
 // OpenBundle streams a stored bundle.
+//
+// Before reading it prefetches the underlying pack blobs into the local
+// cache in bulk. Without this, kopia fetches each ~128KB content with its
+// own round trip, making cold reads latency-bound (measured: a ~100MB
+// clone over a 50ms-RTT link took 37s chunk-by-chunk vs transfer-bound
+// with prefetch).
 func (r *Repo) OpenBundle(ctx context.Context, objectID string) (io.ReadCloser, int64, error) {
 	oid, err := object.ParseID(objectID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("invalid object ID %q: %w", objectID, err)
 	}
+	// Best-effort: when prefetching fails, sequential reads below surface
+	// the real error (or succeed slowly).
+	r.rep.PrefetchObjects(ctx, []object.ID{oid}, "fetch") //nolint:errcheck
+
 	rd, err := r.rep.OpenObject(ctx, oid)
 	if err != nil {
 		return nil, 0, fmt.Errorf("opening bundle: %w", err)

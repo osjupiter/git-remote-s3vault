@@ -18,12 +18,14 @@ import (
 	"time"
 
 	"filippo.io/age"
+	toxiclient "github.com/Shopify/toxiproxy/v2/client"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/testcontainers/testcontainers-go"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
+	tctoxiproxy "github.com/testcontainers/testcontainers-go/modules/toxiproxy"
 )
 
 const bucket = "git-remotes"
@@ -39,6 +41,13 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWithLatency(t, 0)
+}
+
+// newHarnessWithLatency inserts a toxiproxy container between git and
+// MinIO adding the given one-way latency (RTT = 2x), so tests can measure
+// behavior on realistic networks instead of a zero-latency loopback.
+func newHarnessWithLatency(t *testing.T, delay time.Duration) *harness {
 	t.Helper()
 	testcontainers.SkipIfProviderIsNotHealthy(t)
 	ctx := context.Background()
@@ -61,6 +70,13 @@ func newHarness(t *testing.T) *harness {
 		t.Fatal(err)
 	}
 	endpoint = "http://" + endpoint
+
+	// gitEndpoint is what the helper talks to; with latency it goes
+	// through toxiproxy while bucket administration stays direct.
+	gitEndpoint := endpoint
+	if delay > 0 {
+		gitEndpoint = "http://" + startLatencyProxy(t, minioC, delay)
+	}
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion("us-east-1"),
@@ -88,12 +104,12 @@ func newHarness(t *testing.T) *harness {
 	}
 
 	h := &harness{
-		binDir: binDir, endpoint: endpoint, s3c: s3c, identity: id,
+		binDir: binDir, endpoint: gitEndpoint, s3c: s3c, identity: id,
 		username: minioC.Username, password: minioC.Password,
 	}
 	h.baseEnv = append(os.Environ(),
 		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"AWS_ENDPOINT_URL="+endpoint,
+		"AWS_ENDPOINT_URL="+gitEndpoint,
 		"AWS_ACCESS_KEY_ID="+minioC.Username,
 		"AWS_SECRET_ACCESS_KEY="+minioC.Password,
 		"GIT_REMOTE_S3EE_AGE_RECIPIENTS="+id.Recipient().String(),
@@ -105,6 +121,51 @@ func newHarness(t *testing.T) *harness {
 		"HOME="+t.TempDir(),
 	)
 	return h
+}
+
+// startLatencyProxy runs toxiproxy between the tests and MinIO, adding
+// the given one-way latency in both directions. Returns host:port that
+// proxies to MinIO's S3 port.
+func startLatencyProxy(t *testing.T, minioC *tcminio.MinioContainer, delay time.Duration) string {
+	t.Helper()
+	ctx := context.Background()
+
+	upstreamIP, err := minioC.ContainerIP(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toxiC, err := tctoxiproxy.Run(ctx, "ghcr.io/shopify/toxiproxy:2.12.0",
+		testcontainers.WithExposedPorts("8666/tcp"))
+	if err != nil {
+		t.Fatalf("starting toxiproxy: %v", err)
+	}
+	t.Cleanup(func() { testcontainers.TerminateContainer(toxiC) })
+
+	uri, err := toxiC.URI(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := toxiclient.NewClient(uri)
+	proxy, err := client.CreateProxy("minio", "0.0.0.0:8666", upstreamIP+":9000")
+	if err != nil {
+		t.Fatalf("creating proxy: %v", err)
+	}
+	for _, stream := range []string{"upstream", "downstream"} {
+		if _, err := proxy.AddToxic("lat-"+stream, "latency", stream, 1.0,
+			toxiclient.Attributes{"latency": delay.Milliseconds()}); err != nil {
+			t.Fatalf("adding latency toxic: %v", err)
+		}
+	}
+
+	host, err := toxiC.Host(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := toxiC.MappedPort(ctx, "8666/tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("%s:%s", host, port.Port())
 }
 
 func (h *harness) git(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {
@@ -800,6 +861,52 @@ func TestCloneCommandFlow(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(work, "wizclone", "hello.txt")); err != nil || string(data) != "clone me\n" {
 		t.Fatalf("wizard-cloned content: %q, %v", data, err)
+	}
+}
+
+// TestCloneOverHighLatencyLink reproduces the real-world "clone is very
+// slow" report: a ~100MB repository cloned cold over a link with ~50ms
+// RTT (toxiproxy). Without blob prefetching, kopia fetches each ~128KB
+// content with its own round trip, so latency multiplies by chunk count.
+func TestCloneOverHighLatencyLink(t *testing.T) {
+	h := newHarnessWithLatency(t, 25*time.Millisecond) // ~50ms RTT
+	remoteURL := "s3ee://" + bucket + "/latency"
+
+	repo := t.TempDir()
+	h.mustGit(t, repo, "init", "-q", "-b", "main")
+	blob := make([]byte, 100<<20)
+	if _, err := rand.Read(blob); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "big.bin"), blob, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustGit(t, repo, "add", ".")
+	h.mustGit(t, repo, "commit", "-q", "-m", "big")
+	h.mustGit(t, repo, "remote", "add", "origin", remoteURL)
+
+	pushStart := time.Now()
+	h.mustGit(t, repo, "push", "-q", "origin", "main")
+	t.Logf("push of ~100MB over ~50ms RTT: %v", time.Since(pushStart))
+
+	// Cold clone: fresh kopia cache, as on a brand-new machine.
+	work := t.TempDir()
+	coldEnv := []string{"XDG_CACHE_HOME=" + t.TempDir()}
+	cloneStart := time.Now()
+	if out, err := h.git(t, work, coldEnv, "clone", "-q", remoteURL, "big"); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	cloneTook := time.Since(cloneStart)
+	t.Logf("cold clone of ~100MB over ~50ms RTT: %v", cloneTook)
+
+	data, err := os.ReadFile(filepath.Join(work, "big", "big.bin"))
+	if err != nil || !bytes.Equal(data, blob) {
+		t.Fatalf("cloned content mismatch (err=%v, %d bytes)", err, len(data))
+	}
+	// Latency-bound chunk-by-chunk fetching would take 800+ round trips
+	// (~40s+); a prefetching implementation is transfer-bound instead.
+	if cloneTook > 30*time.Second {
+		t.Fatalf("cold clone took %v — reads are latency-bound (missing prefetch?)", cloneTook)
 	}
 }
 

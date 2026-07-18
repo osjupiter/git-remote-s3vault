@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	filippo.io/age v1.3.1
+	github.com/Shopify/toxiproxy/v2 v2.12.0
 	github.com/aws/aws-sdk-go-v2 v1.42.1
 	github.com/aws/aws-sdk-go-v2/config v1.32.30
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.29
@@ -11,6 +12,7 @@ require (
 	github.com/kopia/kopia v0.23.1
 	github.com/testcontainers/testcontainers-go v0.43.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.43.0
+	github.com/testcontainers/testcontainers-go/modules/toxiproxy v0.43.0
 	golang.org/x/crypto v0.52.0
 	golang.org/x/term v0.43.0
 )
