@@ -404,6 +404,20 @@ count/sizes, access timing, the fact that the format is kopia, and the
 keyring metadata (how many member slots exist and their public keys).
 Ref names and commit hashes are **not** visible.
 
+In practice, that means the provider (or anyone who obtains bucket
+access) technically **cannot**:
+
+- read or scan your code and history, or content-filter / selectively
+  censor it — there is no plaintext to inspect
+- leak anything readable in a bucket breach — stolen objects are
+  ciphertext without the keys
+- mine, index, or train on your repository contents
+
+And, to be equally clear about what E2EE does **not** prevent: the
+provider can still delete your data or refuse service outright (keep
+clones — every clone is a full copy), and metadata (object sizes, access
+timing, your account identity) remains visible.
+
 ### Caveats
 
 - Pushing creates a full bundle locally even though only deltas are
