@@ -76,6 +76,130 @@ func (g Git) BundleUnbundle(path string) error {
 	return err
 }
 
+// BundleCreateRefs writes one bundle containing the full history of every
+// given sha (the fast path when all snapshot refs exist locally). Ref
+// names inside the bundle are irrelevant — fetch only unbundles objects.
+func (g Git) BundleCreateRefs(path string, shas []string) error {
+	var tmpRefs []string
+	for i, sha := range shas {
+		ref := fmt.Sprintf("refs/git-remote-s3vault/snap-%d", i)
+		if _, err := g.run("update-ref", ref, sha); err != nil {
+			return err
+		}
+		tmpRefs = append(tmpRefs, ref)
+	}
+	defer func() {
+		for _, r := range tmpRefs {
+			g.run("update-ref", "-d", r) //nolint:errcheck // cleanup
+		}
+	}()
+	if len(tmpRefs) == 0 {
+		return fmt.Errorf("refusing to create an empty bundle")
+	}
+	args := append([]string{"bundle", "create", path}, tmpRefs...)
+	_, err := g.run(args...)
+	return err
+}
+
+// GitDir resolves the absolute .git directory of the repository the
+// helper runs in — used as a fetch source for the scratch repo.
+func (g Git) GitDir() (string, error) {
+	return g.run("rev-parse", "--absolute-git-dir")
+}
+
+// Scratch is a temporary bare repository used to merge the remote's
+// current snapshot with locally pushed refs before bundling (mattn's
+// git-remote-s3 technique) — it guarantees refs absent from the local
+// clone survive a push untouched.
+type Scratch struct {
+	Dir string
+}
+
+// runIn runs git against the scratch repo. git exports GIT_DIR (and
+// friends) before spawning a remote helper; they point at the invoking
+// repository and would hijack any command aimed at another repo, so the
+// scratch environment strips them.
+func (g Git) runIn(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	env := make([]string, 0, len(os.Environ()))
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		switch name {
+		case "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR":
+			continue
+		}
+		env = append(env, kv)
+	}
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("git -C %s %s: %w: %s", dir, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+// NewScratch initializes a bare scratch repository in dir (which must
+// exist).
+func (g Git) NewScratch(dir string) (*Scratch, error) {
+	if _, err := (Git{}).runIn(dir, "init", "-q", "--bare"); err != nil {
+		return nil, err
+	}
+	return &Scratch{Dir: dir}, nil
+}
+
+// FetchBundle imports every object and ref from a bundle file.
+func (g Git) FetchBundle(s *Scratch, bundlePath string) error {
+	_, err := g.runIn(s.Dir, "fetch", "--quiet", "--force", "--no-tags", bundlePath, "refs/*:refs/*")
+	return err
+}
+
+// FetchLocal force-updates ref in the scratch repo to sha, pulling the
+// objects from the local repository. --no-tags: automatic tag following
+// would collide with an explicit sha:refs/tags/* refspec.
+func (g Git) FetchLocal(s *Scratch, gitDir, sha, ref string) error {
+	_, err := g.runIn(s.Dir, "fetch", "--quiet", "--force", "--no-tags", gitDir, sha+":"+ref)
+	return err
+}
+
+// HasObjectIn reports whether the scratch repo's object database has sha.
+func (g Git) HasObjectIn(s *Scratch, sha string) bool {
+	_, err := g.runIn(s.Dir, "cat-file", "-e", sha)
+	return err == nil
+}
+
+// UpdateRefIn points ref at sha in the scratch repo (the object must
+// already be present).
+func (g Git) UpdateRefIn(s *Scratch, ref, sha string) error {
+	_, err := g.runIn(s.Dir, "update-ref", ref, sha)
+	return err
+}
+
+// ListRefsIn returns every ref name in the scratch repo.
+func (g Git) ListRefsIn(s *Scratch) ([]string, error) {
+	out, err := g.runIn(s.Dir, "for-each-ref", "--format=%(refname)")
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
+}
+
+// DeleteRefIn removes a ref from the scratch repo.
+func (g Git) DeleteRefIn(s *Scratch, ref string) error {
+	_, err := g.runIn(s.Dir, "update-ref", "-d", ref)
+	return err
+}
+
+// BundleAll writes a bundle of every ref in the scratch repo.
+func (g Git) BundleAll(s *Scratch, path string) error {
+	_, err := g.runIn(s.Dir, "bundle", "create", path, "--all")
+	return err
+}
+
 // LooseObjectStats reports how many loose (unpacked) objects the local
 // repository has and their total size in KiB. Bundling is much slower on
 // loose objects because git re-deltifies and re-compresses each one,

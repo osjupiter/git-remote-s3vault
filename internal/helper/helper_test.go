@@ -1,9 +1,11 @@
 package helper
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -383,9 +385,12 @@ func TestPlaintextModeWorksWithoutAnyKeys(t *testing.T) {
 	if !strings.Contains(out, "ok refs/heads/main\n") {
 		t.Fatalf("plaintext push failed: %q", out)
 	}
-	// No keyring is created in plaintext mode.
-	if len(memKeys(e.store)) != 0 {
-		t.Fatalf("plaintext mode must not create key material: %v", memKeys(e.store))
+	// No keyring is created in plaintext mode (the state record is data,
+	// not key material).
+	for _, k := range memKeys(e.store) {
+		if strings.Contains(k, ".keys") {
+			t.Fatalf("plaintext mode must not create key material: %v", memKeys(e.store))
+		}
 	}
 	// A fresh clone works without any identity.
 	dst := t.TempDir()
@@ -400,7 +405,7 @@ func TestProgressOutput(t *testing.T) {
 
 	// Default verbosity: pushing narrates the slow steps on stderr.
 	_, stderr := e.runSessionErr(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
-	for _, want := range []string{"bundling refs/heads/main", "uploading refs/heads/main", "encrypted"} {
+	for _, want := range []string{"bundling snapshot", "uploading snapshot", "encrypted"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("progress output missing %q:\n%s", want, stderr)
 		}
@@ -411,7 +416,7 @@ func TestProgressOutput(t *testing.T) {
 	dst := t.TempDir()
 	git(t, dst, "init", "-q", "-b", "main")
 	_, stderr = e.runSessionErr(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha))
-	for _, want := range []string{"downloading refs/heads/main", "unbundling"} {
+	for _, want := range []string{"downloading snapshot", "unbundling"} {
 		if !strings.Contains(stderr, want) {
 			t.Errorf("fetch progress missing %q:\n%s", want, stderr)
 		}
@@ -508,4 +513,203 @@ func memKeys(m *storage.Memory) []string {
 		ks = append(ks, o.Key)
 	}
 	return ks
+}
+
+// TestConcurrentPushLosesCleanly: session A reads the remote, session B
+// pushes in between, and A's push must fail with a retryable
+// concurrent-push error while B's push stands.
+func TestConcurrentPushLosesCleanly(t *testing.T) {
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t)
+	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+
+	// Session A opens and reads the remote state over a pipe so we can
+	// interleave another push before A's.
+	t.Chdir(src)
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	hA := New(e.cfg, e.store, inR, outW, io.Discard)
+	done := make(chan error, 1)
+	go func() {
+		err := hA.Run(context.Background())
+		outW.Close()
+		done <- err
+	}()
+	rd := bufio.NewReader(outR)
+	readBlock := func() string {
+		var b strings.Builder
+		for {
+			line, err := rd.ReadString('\n')
+			b.WriteString(line)
+			if err != nil || line == "\n" {
+				return b.String()
+			}
+		}
+	}
+	if _, err := io.WriteString(inW, "list for-push\n"); err != nil {
+		t.Fatal(err)
+	}
+	readBlock()
+
+	// B lands a push while A holds its stale view.
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "from-b")
+	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	shaB := git(t, src, "rev-parse", "HEAD")
+	t.Chdir(src)
+
+	// A pushes a newer commit — a valid fast-forward from A's point of
+	// view, but the CAS token is stale.
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "from-a")
+	if _, err := io.WriteString(inW, "push refs/heads/main:refs/heads/main\n\n"); err != nil {
+		t.Fatal(err)
+	}
+	result := readBlock()
+	inW.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("session A failed: %v", err)
+	}
+	if !strings.Contains(result, "error refs/heads/main") || !strings.Contains(result, "concurrent push detected") {
+		t.Fatalf("expected a concurrent-push error, got: %q", result)
+	}
+
+	// B's push stands.
+	out := e.runSession(t, src, "list\n\n")
+	if !strings.Contains(out, shaB+" refs/heads/main") {
+		t.Fatalf("B's push was clobbered:\n%s", out)
+	}
+}
+
+// TestV2RemoteMigratesOnFirstPush: a remote written by the pre-snapshot
+// format (per-ref kopia manifests) lists fine, and the first push
+// converts it to the snapshot format and removes the old manifests.
+func TestV2RemoteMigratesOnFirstPush(t *testing.T) {
+	ctx := context.Background()
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t)
+	sha1 := git(t, src, "rev-parse", "HEAD")
+
+	// Seed a legacy v2 remote: keyring plus one per-ref bundle manifest.
+	kr := keyring.New(e.store, "repo")
+	dek, err := kr.Init(ctx, []string{e.id.Recipient().String()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := kopiax.Open(ctx, e.cfg, dek.String(), kopiax.FirstGeneration, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(t.TempDir(), "main.bundle")
+	git(t, src, "bundle", "create", bundle, "refs/heads/main")
+	f, err := os.Open(bundle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, perr := rep.PushRef(ctx, "refs/heads/main", sha1, f, true)
+	f.Close()
+	if perr != nil {
+		t.Fatal(perr)
+	}
+	rep.Close(ctx)
+
+	// Read compatibility: the v2 remote lists and fetches.
+	out := e.runSession(t, src, "list\n\n")
+	if !strings.Contains(out, sha1+" refs/heads/main") {
+		t.Fatalf("v2 remote not listed:\n%s", out)
+	}
+
+	// First push migrates.
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "two")
+	sha2 := git(t, src, "rev-parse", "HEAD")
+	out = e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\n\n")
+	if !strings.Contains(out, "ok refs/heads/main") {
+		t.Fatalf("migration push failed:\n%s", out)
+	}
+	if _, err := e.store.Get(ctx, "repo/state-data"); err != nil {
+		t.Fatal("no state record after migration push")
+	}
+	rep2, err := kopiax.Open(ctx, e.cfg, dek.String(), kopiax.FirstGeneration, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refs, err := rep2.Refs(ctx)
+	rep2.Close(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 0 {
+		t.Fatalf("v2 manifests should be cleaned up after migration: %+v", refs)
+	}
+
+	// A fresh clone sees the migrated remote.
+	dst := t.TempDir()
+	git(t, dst, "init", "-q", "-b", "main")
+	e.runSession(t, dst, fmt.Sprintf("list\nfetch %s refs/heads/main\n\n", sha2))
+	git(t, dst, "cat-file", "-e", sha2)
+}
+
+// TestBatchFetchDownloadsSnapshotOnce: cloning N refs downloads and
+// unbundles exactly one snapshot bundle.
+func TestBatchFetchDownloadsSnapshotOnce(t *testing.T) {
+	e := newTestEnv(t)
+	src := newRepoWithCommit(t)
+	shaMain := git(t, src, "rev-parse", "main")
+	git(t, src, "checkout", "-q", "-b", "dev")
+	git(t, src, "commit", "-q", "--allow-empty", "-m", "dev1")
+	shaDev := git(t, src, "rev-parse", "dev")
+	e.runSession(t, src, "list for-push\npush refs/heads/main:refs/heads/main\npush refs/heads/dev:refs/heads/dev\n\n")
+
+	dst := t.TempDir()
+	git(t, dst, "init", "-q", "-b", "main")
+	_, stderr := e.runSessionErr(t, dst,
+		fmt.Sprintf("list\nfetch %s refs/heads/main\nfetch %s refs/heads/dev\n\n", shaMain, shaDev))
+	if n := strings.Count(stderr, "downloading snapshot"); n != 1 {
+		t.Fatalf("snapshot downloaded %d times, want 1:\n%s", n, stderr)
+	}
+	git(t, dst, "cat-file", "-e", shaMain)
+	git(t, dst, "cat-file", "-e", shaDev)
+}
+
+// TestPushMergesRefsAbsentFromLocalClone: pushing from a machine that
+// never fetched some remote refs must not drop them — the helper merges
+// the remote snapshot with the pushed refs through a scratch repo.
+func TestPushMergesRefsAbsentFromLocalClone(t *testing.T) {
+	e := newTestEnv(t)
+	a := newRepoWithCommit(t)
+	shaMain := git(t, a, "rev-parse", "main")
+	git(t, a, "checkout", "-q", "-b", "topic")
+	git(t, a, "commit", "-q", "--allow-empty", "-m", "t1")
+	shaTopic := git(t, a, "rev-parse", "topic")
+	e.runSession(t, a, "list for-push\npush refs/heads/main:refs/heads/main\npush refs/heads/topic:refs/heads/topic\n\n")
+
+	// B has a completely unrelated history and none of A's objects.
+	b := t.TempDir()
+	git(t, b, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(b, "b.txt"), []byte("b\n"), 0o644)
+	git(t, b, "add", ".")
+	git(t, b, "commit", "-q", "-m", "b1")
+	git(t, b, "tag", "vb") // tag on the pushed commit: exercises tag-vs-refspec collision in the scratch merge
+	shaOther := git(t, b, "rev-parse", "main")
+	out := e.runSession(t, b, "list for-push\npush refs/heads/main:refs/heads/other\npush refs/tags/vb:refs/tags/vb\n\n")
+	if !strings.Contains(out, "ok refs/heads/other") || !strings.Contains(out, "ok refs/tags/vb") {
+		t.Fatalf("push from partial clone failed:\n%s", out)
+	}
+
+	// All three refs survive, and every object is fetchable.
+	c := t.TempDir()
+	git(t, c, "init", "-q", "-b", "main")
+	out = e.runSession(t, c, "list\n\n")
+	for _, want := range []string{
+		shaMain + " refs/heads/main",
+		shaTopic + " refs/heads/topic",
+		shaOther + " refs/heads/other",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in listing:\n%s", want, out)
+		}
+	}
+	e.runSession(t, c, fmt.Sprintf("list\nfetch %s refs/heads/main\nfetch %s refs/heads/topic\nfetch %s refs/heads/other\n\n",
+		shaMain, shaTopic, shaOther))
+	for _, sha := range []string{shaMain, shaTopic, shaOther} {
+		git(t, c, "cat-file", "-e", sha)
+	}
 }

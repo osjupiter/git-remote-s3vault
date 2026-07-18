@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path"
 	"strings"
 
@@ -38,8 +39,10 @@ import (
 
 	"github.com/osjupiter/git-remote-s3vault/internal/config"
 	"github.com/osjupiter/git-remote-s3vault/internal/cryptox"
+	"github.com/osjupiter/git-remote-s3vault/internal/gitutil"
 	"github.com/osjupiter/git-remote-s3vault/internal/keyring"
 	"github.com/osjupiter/git-remote-s3vault/internal/kopiax"
+	"github.com/osjupiter/git-remote-s3vault/internal/snapshot"
 	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
@@ -154,7 +157,14 @@ func (r *Rotator) SweepStaleGenerations(ctx context.Context) error {
 	for _, o := range objs {
 		rel := strings.TrimPrefix(o.Key, r.key("")+"/")
 		gen, _, found := strings.Cut(rel, "/")
-		if !found || !strings.HasPrefix(gen, "data") || gen == r.CurGen || gen == r.NextGen {
+		if !found {
+			// State records live beside the generation dirs as state-<gen>.
+			gen, found = strings.CutPrefix(rel, "state-")
+			if !found {
+				continue
+			}
+		}
+		if !strings.HasPrefix(gen, "data") || gen == r.CurGen || gen == r.NextGen {
 			continue
 		}
 		if err := r.store.Delete(ctx, o.Key); err != nil {
@@ -168,9 +178,11 @@ func (r *Rotator) SweepStaleGenerations(ctx context.Context) error {
 	return nil
 }
 
-// Build copies every ref (and HEAD) from the current generation into the
-// next one, re-encrypted under the new DEK. Re-runs are incremental
-// thanks to kopia deduplication. Loops until the source refs are stable.
+// Build re-encrypts the repository content into the next generation as a
+// v3 snapshot: one all-refs bundle plus a state record, whatever format
+// the source is in (v3 snapshot, or legacy v2 per-ref manifests, which
+// get merged through a scratch repo). Re-runs are incremental thanks to
+// kopia deduplication. Loops until the source is stable under the copy.
 func (r *Rotator) Build(ctx context.Context) error {
 	oldPW, newPW := r.passwords()
 	src, err := kopiax.Open(ctx, r.cfg, oldPW, r.CurGen, false)
@@ -184,57 +196,157 @@ func (r *Rotator) Build(ctx context.Context) error {
 	}
 	defer dst.Close(ctx)
 
-	copied := map[string]string{} // refname -> sha copied so far
+	var dekOld *age.X25519Identity
+	if r.cfg.Encryption != config.EncryptionNone {
+		dekOld = r.dekOld
+	}
+
 	for round := 1; ; round++ {
-		refs, err := src.Refs(ctx)
+		state, srcETag, err := snapshot.Load(ctx, r.store, r.cfg.Prefix, r.CurGen, dekOld)
 		if err != nil {
 			return err
 		}
-		changed := 0
-		for name, ri := range refs {
-			if copied[name] == ri.SHA {
-				continue
-			}
-			rc, size, err := src.OpenBundle(ctx, ri.Object)
-			if err != nil {
-				return fmt.Errorf("reading %s from %s: %w", name, r.CurGen, err)
-			}
-			_, err = dst.PushRef(ctx, name, ri.SHA, rc, false)
-			rc.Close()
-			if err != nil {
-				return fmt.Errorf("writing %s to %s: %w", name, r.NextGen, err)
-			}
-			r.logf("re-encrypted %s (%s)", name, humanSize(size))
-			copied[name] = ri.SHA
-			changed++
-		}
-		for name := range copied {
-			if _, ok := refs[name]; !ok {
-				if err := dst.DeleteRef(ctx, name); err != nil {
-					return err
+
+		var newState *snapshot.State
+		if state != nil {
+			newState = &snapshot.State{Refs: state.Refs, Head: state.Head}
+			if state.Bundle != "" {
+				rc, size, err := src.OpenBundle(ctx, state.Bundle)
+				if err != nil {
+					return fmt.Errorf("reading snapshot bundle from %s: %w", r.CurGen, err)
 				}
-				delete(copied, name)
-				changed++
+				oid, err := dst.WriteBundle(ctx, rc)
+				rc.Close()
+				if err != nil {
+					return fmt.Errorf("writing snapshot bundle to %s: %w", r.NextGen, err)
+				}
+				newState.Bundle = oid
+				r.logf("re-encrypted snapshot bundle (%s, %d refs)", humanSize(size), len(state.Refs))
+			}
+		} else {
+			// Legacy per-ref source: merge everything into one bundle.
+			if newState, err = r.buildFromPerRef(ctx, src, dst); err != nil {
+				return err
 			}
 		}
-		if changed == 0 {
-			break
+
+		// If the source moved while we copied, redo the round.
+		curETag, err := r.store.ETag(ctx, snapshot.Key(r.cfg.Prefix, r.CurGen))
+		if err != nil {
+			return err
 		}
-		if round >= 5 {
-			return fmt.Errorf("refs keep changing while rotating — is someone pushing? retry later")
+		if curETag != srcETag {
+			if round >= 5 {
+				return fmt.Errorf("refs keep changing while rotating — is someone pushing? retry later")
+			}
+			r.logf("remote changed during rotation; re-syncing")
+			continue
+		}
+
+		var recipient age.Recipient
+		if r.dekNew != nil {
+			recipient = r.dekNew.Recipient()
+		}
+		prevETag, err := r.store.ETag(ctx, snapshot.Key(r.cfg.Prefix, r.NextGen))
+		if err != nil {
+			return err
+		}
+		return snapshot.Save(ctx, r.store, r.cfg.Prefix, r.NextGen, newState, recipient, prevETag)
+	}
+}
+
+// buildFromPerRef converts a legacy v2 generation (one bundle per ref)
+// into a v3 snapshot in dst: every per-ref bundle is imported into a
+// scratch bare repo, the refs are normalized to the manifest table, and
+// one all-refs bundle is emitted.
+func (r *Rotator) buildFromPerRef(ctx context.Context, src, dst *kopiax.Repo) (*snapshot.State, error) {
+	refs, err := src.Refs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	head, err := src.Head(ctx)
+	if err != nil {
+		return nil, err
+	}
+	table := map[string]string{}
+	for name, ri := range refs {
+		table[name] = ri.SHA
+	}
+	newState := &snapshot.State{Refs: table, Head: head}
+	if len(refs) == 0 {
+		return newState, nil
+	}
+
+	scratchDir, err := os.MkdirTemp("", "git-remote-s3vault-rotate-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(scratchDir)
+	var g gitutil.Git
+	scratch, err := g.NewScratch(scratchDir)
+	if err != nil {
+		return nil, err
+	}
+
+	for name, ri := range refs {
+		rc, size, err := src.OpenBundle(ctx, ri.Object)
+		if err != nil {
+			return nil, fmt.Errorf("reading %s from %s: %w", name, r.CurGen, err)
+		}
+		tmp, err := gitutil.TempFile("git-remote-s3vault-rotate-*.bundle")
+		if err != nil {
+			rc.Close()
+			return nil, err
+		}
+		_, cerr := io.Copy(tmp, rc)
+		rc.Close()
+		tmp.Close()
+		if cerr == nil {
+			cerr = g.FetchBundle(scratch, tmp.Name())
+		}
+		os.Remove(tmp.Name())
+		if cerr != nil {
+			return nil, fmt.Errorf("merging %s: %w", name, cerr)
+		}
+		r.logf("merged %s (%s)", name, humanSize(size))
+	}
+	for name, sha := range table {
+		if err := g.UpdateRefIn(scratch, name, sha); err != nil {
+			return nil, err
+		}
+	}
+	existing, err := g.ListRefsIn(scratch)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range existing {
+		if _, keep := table[name]; !keep {
+			g.DeleteRefIn(scratch, name) //nolint:errcheck // cleanup
 		}
 	}
 
-	head, err := src.Head(ctx)
+	bundle, err := gitutil.TempFile("git-remote-s3vault-rotate-all-*.bundle")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if head != "" {
-		if err := dst.SetHead(ctx, head); err != nil {
-			return err
-		}
+	bundlePath := bundle.Name()
+	bundle.Close()
+	os.Remove(bundlePath)
+	defer os.Remove(bundlePath)
+	if err := g.BundleAll(scratch, bundlePath); err != nil {
+		return nil, err
 	}
-	return nil
+	f, err := os.Open(bundlePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	oid, err := dst.WriteBundle(ctx, f)
+	if err != nil {
+		return nil, err
+	}
+	newState.Bundle = oid
+	return newState, nil
 }
 
 // RewrapKeys wraps the new DEK for every existing slot (members and the
@@ -278,7 +390,8 @@ func (r *Rotator) Flip(ctx context.Context) error {
 	return nil
 }
 
-// Cleanup deletes the old generation and the staged DEK.
+// Cleanup deletes the old generation (kopia blobs and state record) and
+// the staged DEK.
 func (r *Rotator) Cleanup(ctx context.Context) error {
 	prefix := r.key(r.CurGen) + "/"
 	objs, err := r.store.List(ctx, prefix)
@@ -289,6 +402,9 @@ func (r *Rotator) Cleanup(ctx context.Context) error {
 		if err := r.store.Delete(ctx, o.Key); err != nil {
 			return fmt.Errorf("deleting old generation: %w", err)
 		}
+	}
+	if err := snapshot.Delete(ctx, r.store, r.cfg.Prefix, r.CurGen); err != nil {
+		r.logf("warning: could not remove old state record: %v", err)
 	}
 	if err := r.store.Delete(ctx, r.key(stagedDEKName)); err != nil {
 		r.logf("warning: could not remove staged rotation key: %v", err)

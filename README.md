@@ -374,32 +374,47 @@ After rotating, also reissue the bucket's S3 API token — a removed
 member who kept cached key material can do nothing without ciphertext
 access.
 
-**Data layer ([kopia](https://kopia.io)'s repository engine).** Each push
-stores a self-contained git bundle of the ref's full history as a kopia
-object; refs and HEAD are kopia manifests. The DEK is the kopia
-repository password. kopia provides content-defined chunking with
-**deduplication**, AES-256-GCM encryption, packing, and local caching
-(under `~/.cache/git-remote-s3vault/`) — so although every push writes a
-"full" bundle, only the chunks that actually changed are uploaded and
-stored. Measured in the e2e suite: on a ~3 MB repository, pushing a tag
-adds ~5 KB and a small commit ~300 KB.
+**Data layer ([kopia](https://kopia.io)'s repository engine +
+snapshots).** Each push stores ONE self-contained git bundle covering
+**all refs** as a kopia object, then atomically swaps in a small
+encrypted **state record** (`state-<generation>`: the complete ref
+table, HEAD, and the bundle's object ID) with an ETag compare-and-swap.
+The DEK is the kopia repository password. kopia provides content-defined
+chunking with **deduplication**, AES-256-GCM encryption, packing, and
+local caching (under `~/.cache/git-remote-s3vault/`) — so although every
+push writes a "full" bundle, only the chunks that actually changed are
+uploaded and stored. Measured in the e2e suite: on a ~3 MB repository,
+pushing a tag adds ~5 KB and a small commit ~300 KB.
 
 ```mermaid
 flowchart LR
-    G["git push"] --> BND["full-history bundle<br/>(stream copy on a packed repo)"]
+    G["git push"] --> BND["all-refs bundle<br/>(stream copy on a packed repo)"]
     BND --> KOP["kopia:<br/>chunk, dedup, encrypt"]
     KOP -->|"changed chunks only"| BKT[("bucket data/")]
+    KOP -->|"CAS state record"| ST[("state-data")]
     BKT -->|"bulk prefetch"| KOP2["kopia:<br/>decrypt from cache"]
-    KOP2 --> UNB["bundle → git unbundle"] --> C["git clone / fetch"]
+    KOP2 --> UNB["ONE bundle → git unbundle"] --> C["git clone / fetch"]
 ```
 
 - Branches and tags cost almost nothing: shared history is stored once.
+- Clone/fetch downloads and unbundles **one bundle total**, no matter
+  how many branches and tags exist (the snapshot model of
+  [mattn/git-remote-s3](https://github.com/mattn/git-remote-s3)).
+- A multi-ref push (`git push --all`, atomic pushes) lands as one
+  atomic state swap; **concurrent pushes cannot interleave per ref** —
+  the loser gets "concurrent push detected; fetch and retry".
+- Pushing from a clone that never fetched some remote refs is safe: the
+  helper merges the remote's current snapshot with your refs in a
+  scratch repository before bundling, so unseen refs survive.
 - Pushes enforce fast-forward unless `--force` is used (ancestry is
   checked locally against the advertised remote sha).
 - `list`/`fetch` need no local bookkeeping: git's own object database
   answers "do I already have this?".
 - The local cache (`git-remote-s3vault cache path`) is bounded per remote
   and safe to delete at any time: `git-remote-s3vault cache clean`.
+- Remotes written by versions ≤ 0.1.1 (one bundle per ref) are read
+  transparently; the first push — or a `key rotate` — migrates them to
+  the snapshot format.
 
 ### Threat model
 
@@ -435,15 +450,13 @@ timing, your account identity) remains visible.
 - Storage grows by roughly the changed bytes per push; deleted branches
   and force-push debris are reclaimed by `key rotate`, which doubles as a
   full repack. Do **not** run kopia's own maintenance against the bucket
-  — it does not know about the helper's manifests.
-- Two clients force-pushing the same ref at the same instant race
-  last-writer-wins; the ref converges to one of them (nothing is lost —
-  the other side's commits stay in their local clone and the next push
-  surfaces the divergence). Repository-key initialization and rotation
-  generation flips are guarded with lock-free conditional writes
-  (compare-and-swap; supported by R2, AWS S3, and recent MinIO, with a
-  plain-write fallback elsewhere), so concurrent setups or rotations
-  cannot corrupt key material.
+  — it does not know about the helper's state records.
+- Concurrent pushes, repository-key initialization, and rotation
+  generation flips are all guarded with lock-free conditional writes
+  (compare-and-swap; supported by R2, AWS S3, and recent MinIO). A losing
+  push fails cleanly with "concurrent push detected; fetch and retry" —
+  nothing is lost and no lock can leak. On backends without conditional
+  writes the state write degrades to plain last-writer-wins.
 
 ## Development
 

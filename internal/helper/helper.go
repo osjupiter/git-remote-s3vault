@@ -4,15 +4,21 @@
 //
 // Remote layout:
 //
-//	<prefix>/.keys/...   keyring: the repository DEK wrapped per member key
-//	<prefix>/data/...    kopia repository (opaque encrypted blobs)
+//	<prefix>/.keys/...     keyring: the repository DEK wrapped per member key
+//	<prefix>/state-<gen>   snapshot state record: complete ref table, HEAD,
+//	                       and the object ID of the all-refs bundle
+//	                       (age-encrypted, ETag compare-and-swap)
+//	<prefix>/data/...      kopia repository (opaque encrypted blobs)
 //
-// Each pushed ref stores a self-contained git bundle as a kopia object;
-// kopia's content-defined chunking deduplicates the redundancy between
-// successive bundles and between refs, so a full-bundle push uploads only
-// the changed chunks. Refs and HEAD are kopia manifests. The kopia
-// repository password is the DEK managed by the keyring (an age X25519
-// identity wrapped per member public key).
+// Every push stores ONE self-contained git bundle covering all refs as a
+// kopia object and swaps the state record in atomically; kopia's
+// content-defined chunking deduplicates successive bundles, so a push
+// uploads only the changed chunks and a clone downloads one bundle no
+// matter how many refs exist. Concurrent pushes lose the CAS cleanly and
+// are told to fetch and retry. Remotes written by the older per-ref
+// format (refs as kopia manifests) are still readable; the first push
+// migrates them. The kopia repository password is the DEK managed by the
+// keyring (an age X25519 identity wrapped per member public key).
 package helper
 
 import (
@@ -33,6 +39,7 @@ import (
 	"github.com/osjupiter/git-remote-s3vault/internal/gitutil"
 	"github.com/osjupiter/git-remote-s3vault/internal/keyring"
 	"github.com/osjupiter/git-remote-s3vault/internal/kopiax"
+	"github.com/osjupiter/git-remote-s3vault/internal/snapshot"
 	"github.com/osjupiter/git-remote-s3vault/internal/storage"
 )
 
@@ -51,7 +58,7 @@ var (
 
 type remoteRef struct {
 	sha    string
-	object string // kopia object ID of the bundle
+	object string // per-ref bundle object ID (pre-snapshot v2 format only)
 }
 
 // Helper drives one remote-helper session over stdin/stdout.
@@ -72,6 +79,10 @@ type Helper struct {
 	gcHintShown bool
 
 	krepo      *kopiax.Repo
+	gen        string          // active data generation
+	state      *snapshot.State // current snapshot (nil = empty or v2 remote)
+	stateETag  string          // CAS token captured when the state was read
+	unbundled  bool            // the snapshot bundle was already applied locally
 	password   string
 	identities []age.Identity
 }
@@ -212,13 +223,26 @@ func (h *Helper) ensureRepo(ctx context.Context, create bool) error {
 	if err := h.ensureStore(ctx); err != nil {
 		return err
 	}
-	gen := kopiax.CurrentGeneration(ctx, h.store, h.cfg.Prefix)
-	kr, err := kopiax.Open(ctx, h.cfg, pw, gen, create)
+	h.gen = kopiax.CurrentGeneration(ctx, h.store, h.cfg.Prefix)
+	kr, err := kopiax.Open(ctx, h.cfg, pw, h.gen, create)
 	if err != nil {
 		return err
 	}
 	h.krepo = kr
 	return nil
+}
+
+// dekIdentity returns the DEK as an age identity for state
+// encryption/decryption (nil in plaintext mode).
+func (h *Helper) dekIdentity() *age.X25519Identity {
+	if h.cfg.Encryption == config.EncryptionNone || h.password == "" {
+		return nil
+	}
+	id, err := age.ParseX25519Identity(h.password)
+	if err != nil {
+		return nil
+	}
+	return id
 }
 
 // repoPassword resolves the kopia repository password: the plaintext-mode
@@ -290,11 +314,15 @@ func (h *Helper) repoPassword(ctx context.Context, create bool) (string, error) 
 	return h.password, nil
 }
 
-// loadRemoteRefs reads refs and HEAD from the kopia repository. A remote
-// that was never pushed to yields empty results.
+// loadRemoteRefs reads refs and HEAD: from the snapshot state record
+// (current format), or from per-ref kopia manifests (pre-snapshot v2
+// remotes, read-only compatibility). A remote never pushed to yields
+// empty results.
 func (h *Helper) loadRemoteRefs(ctx context.Context) error {
 	h.refs = map[string]remoteRef{}
 	h.headRef = ""
+	h.state = nil
+	h.stateETag = ""
 
 	err := h.ensureRepo(ctx, false)
 	if errors.Is(err, errEmptyRemote) || errors.Is(err, kopiax.ErrNotInitialized) {
@@ -304,6 +332,21 @@ func (h *Helper) loadRemoteRefs(ctx context.Context) error {
 		return err
 	}
 
+	st, etag, err := snapshot.Load(ctx, h.store, h.cfg.Prefix, h.gen, h.dekIdentity())
+	if err != nil {
+		return err
+	}
+	if st != nil {
+		h.state = st
+		h.stateETag = etag
+		for name, sha := range st.Refs {
+			h.refs[name] = remoteRef{sha: sha}
+		}
+		h.headRef = h.pickHead(st.Head)
+		return nil
+	}
+
+	// v2 fallback: refs as individual kopia manifests.
 	refs, err := h.krepo.Refs(ctx)
 	if err != nil {
 		return err
@@ -311,35 +354,36 @@ func (h *Helper) loadRemoteRefs(ctx context.Context) error {
 	for name, ri := range refs {
 		h.refs[name] = remoteRef{sha: ri.SHA, object: ri.Object}
 	}
-
 	head, err := h.krepo.Head(ctx)
 	if err != nil {
 		return err
 	}
-	if _, ok := h.refs[head]; ok {
-		h.headRef = head
-	}
-	if h.headRef == "" {
-		for _, fallback := range []string{"refs/heads/main", "refs/heads/master"} {
-			if _, ok := h.refs[fallback]; ok {
-				h.headRef = fallback
-				break
-			}
-		}
-	}
-	if h.headRef == "" {
-		var branches []string
-		for r := range h.refs {
-			if strings.HasPrefix(r, "refs/heads/") {
-				branches = append(branches, r)
-			}
-		}
-		sort.Strings(branches)
-		if len(branches) > 0 {
-			h.headRef = branches[0]
-		}
-	}
+	h.headRef = h.pickHead(head)
 	return nil
+}
+
+// pickHead validates the stored HEAD target and falls back to a sensible
+// branch when it is unset or dangling.
+func (h *Helper) pickHead(stored string) string {
+	if _, ok := h.refs[stored]; ok {
+		return stored
+	}
+	for _, fallback := range []string{"refs/heads/main", "refs/heads/master"} {
+		if _, ok := h.refs[fallback]; ok {
+			return fallback
+		}
+	}
+	var branches []string
+	for r := range h.refs {
+		if strings.HasPrefix(r, "refs/heads/") {
+			branches = append(branches, r)
+		}
+	}
+	sort.Strings(branches)
+	if len(branches) > 0 {
+		return branches[0]
+	}
+	return ""
 }
 
 func (h *Helper) cmdList(ctx context.Context) error {
@@ -392,8 +436,8 @@ func (h *Helper) cmdFetchBatch(ctx context.Context, first string) error {
 		if done[w.sha] {
 			continue
 		}
-		// Already present locally — e.g. a lightweight tag on a commit an
-		// earlier bundle in this batch delivered: no download needed.
+		// Already present locally — e.g. a lightweight tag on a commit the
+		// snapshot bundle delivered: no download needed.
 		if h.git.HasObject(w.sha) {
 			h.logf("%s (%s) already present locally; skipping download", w.name, w.sha[:12])
 			done[w.sha] = true
@@ -409,12 +453,30 @@ func (h *Helper) cmdFetchBatch(ctx context.Context, first string) error {
 }
 
 func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
+	// Snapshot format: ONE bundle covers every ref; unbundle it once and
+	// every subsequent want in the batch is satisfied from the local odb.
+	if h.state != nil {
+		if h.unbundled {
+			if h.git.HasObject(sha) {
+				return nil
+			}
+			return fmt.Errorf("object %s missing from the snapshot bundle", sha[:12])
+		}
+		if err := h.applyBundleObject(ctx, h.state.Bundle, "snapshot"); err != nil {
+			return err
+		}
+		h.unbundled = true
+		if !h.git.HasObject(sha) {
+			return fmt.Errorf("object %s missing from the snapshot bundle (stale listing? run fetch again)", sha[:12])
+		}
+		return nil
+	}
+
+	// v2 fallback: one bundle per ref.
 	var found *remoteRef
 	if rr, ok := h.refs[name]; ok && rr.sha == sha {
 		found = &rr
 	} else {
-		// The exact sha may live under another ref, or the listing may be
-		// stale; search all known refs for it.
 		for _, rr := range h.refs {
 			if rr.sha == sha {
 				found = &rr
@@ -425,28 +487,45 @@ func (h *Helper) fetchOne(ctx context.Context, sha, name string) error {
 	if found == nil || found.object == "" {
 		return fmt.Errorf("no bundle found for %s", sha)
 	}
+	return h.applyBundleObject(ctx, found.object, name)
+}
 
-	body, size, err := h.krepo.OpenBundle(ctx, found.object)
+// downloadBundleToTemp streams a stored bundle into a temp file.
+func (h *Helper) downloadBundleToTemp(ctx context.Context, objectID, label string) (string, func(), error) {
+	body, size, err := h.krepo.OpenBundle(ctx, objectID)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	defer body.Close()
-	h.progressf("downloading %s (%s)", name, humanSize(size))
+	h.progressf("downloading %s (%s)", label, humanSize(size))
 
 	tmp, err := gitutil.TempFile("git-remote-s3vault-fetch-*.bundle")
 	if err != nil {
-		return err
+		return "", nil, err
 	}
-	defer os.Remove(tmp.Name())
+	cleanup := func() { os.Remove(tmp.Name()) }
 	if _, err := io.Copy(tmp, body); err != nil {
 		tmp.Close()
-		return err
+		cleanup()
+		return "", nil, err
 	}
 	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return tmp.Name(), cleanup, nil
+}
+
+// applyBundleObject downloads a stored bundle and unbundles its objects
+// into the local repository.
+func (h *Helper) applyBundleObject(ctx context.Context, objectID, label string) error {
+	path, cleanup, err := h.downloadBundleToTemp(ctx, objectID, label)
+	if err != nil {
 		return err
 	}
-	h.progressf("unbundling %s", name)
-	return h.git.BundleUnbundle(tmp.Name())
+	defer cleanup()
+	h.progressf("unbundling %s", label)
+	return h.git.BundleUnbundle(path)
 }
 
 // --- push ---
@@ -474,6 +553,17 @@ func (h *Helper) cmdPushBatch(ctx context.Context, first string) error {
 	}
 	h.maybeSuggestGC()
 
+	// Validate every refspec against the current snapshot; the survivors
+	// are applied as ONE new snapshot, atomically.
+	type update struct {
+		dst    string
+		sha    string // "" = delete
+		isNew  bool
+		delete bool
+	}
+	var updates []update
+	report := map[string]string{} // dst -> "" (ok) or error text
+	order := []string{}
 	for _, spec := range specs {
 		force := strings.HasPrefix(spec, "+") || h.forceAll
 		spec = strings.TrimPrefix(spec, "+")
@@ -482,14 +572,90 @@ func (h *Helper) cmdPushBatch(ctx context.Context, first string) error {
 			h.printf("error %s malformed refspec\n", spec)
 			continue
 		}
-		var err error
+		order = append(order, dst)
 		if src == "" {
-			err = h.pushDelete(ctx, dst)
-		} else {
-			err = h.pushRef(ctx, src, dst, force)
+			if _, exists := h.refs[dst]; !exists {
+				report[dst] = "remote ref does not exist"
+				continue
+			}
+			updates = append(updates, update{dst: dst, delete: true})
+			report[dst] = ""
+			continue
 		}
+		localSHA, err := h.git.RevParse(src)
 		if err != nil {
-			h.printf("error %s %s\n", dst, strings.ReplaceAll(err.Error(), "\n", " "))
+			report[dst] = fmt.Sprintf("cannot resolve %s: %v", src, err)
+			continue
+		}
+		if existing, exists := h.refs[dst]; exists && existing.sha != localSHA && !force {
+			if !h.git.HasObject(existing.sha) {
+				report[dst] = fmt.Sprintf("remote is at %s which is not known locally; fetch first", existing.sha[:12])
+				continue
+			}
+			ffwd, err := h.git.IsAncestor(existing.sha, localSHA)
+			if err != nil {
+				report[dst] = err.Error()
+				continue
+			}
+			if !ffwd {
+				report[dst] = fmt.Sprintf("non-fast-forward (remote is at %s); fetch first or force-push", existing.sha[:12])
+				continue
+			}
+		}
+		_, exists := h.refs[dst]
+		updates = append(updates, update{dst: dst, sha: localSHA, isNew: !exists})
+		report[dst] = ""
+	}
+
+	if len(updates) > 0 {
+		// Compute the new complete ref table.
+		newRefs := map[string]string{}
+		for name, rr := range h.refs {
+			newRefs[name] = rr.sha
+		}
+		for _, u := range updates {
+			if u.delete {
+				delete(newRefs, u.dst)
+			} else {
+				newRefs[u.dst] = u.sha
+			}
+		}
+		head := h.headRef
+		if _, ok := newRefs[head]; !ok {
+			head = ""
+		}
+		if head == "" {
+			for _, u := range updates {
+				if !u.delete && strings.HasPrefix(u.dst, "refs/heads/") {
+					head = u.dst
+					break
+				}
+			}
+		}
+
+		if err := h.pushSnapshot(ctx, newRefs, head); err != nil {
+			msg := strings.ReplaceAll(err.Error(), "\n", " ")
+			for _, u := range updates {
+				report[u.dst] = msg
+			}
+		} else {
+			h.headRef = head
+			refs := map[string]remoteRef{}
+			for name, sha := range newRefs {
+				refs[name] = remoteRef{sha: sha}
+			}
+			h.refs = refs
+		}
+	}
+
+	seen := map[string]bool{}
+	for _, dst := range order {
+		if seen[dst] {
+			continue
+		}
+		seen[dst] = true
+		if msg := report[dst]; msg != "" {
+			h.printf("error %s %s\n", dst, msg)
 		} else {
 			h.printf("ok %s\n", dst)
 		}
@@ -498,87 +664,163 @@ func (h *Helper) cmdPushBatch(ctx context.Context, first string) error {
 	return nil
 }
 
-func (h *Helper) pushDelete(ctx context.Context, dst string) error {
-	if _, ok := h.refs[dst]; !ok || h.krepo == nil {
-		return fmt.Errorf("remote ref does not exist")
-	}
-	if err := h.krepo.DeleteRef(ctx, dst); err != nil {
+// pushSnapshot builds the all-refs bundle for the new ref table, uploads
+// it, and swaps the state record in with a compare-and-swap.
+func (h *Helper) pushSnapshot(ctx context.Context, newRefs map[string]string, head string) error {
+	if err := h.ensureRepo(ctx, true); err != nil {
 		return err
 	}
-	delete(h.refs, dst)
-	if h.headRef == dst {
-		if err := h.krepo.DeleteHead(ctx); err != nil {
-			h.warnf("could not delete remote HEAD: %v", err)
-		}
-		h.headRef = ""
-	}
-	return nil
-}
 
-func (h *Helper) pushRef(ctx context.Context, src, dst string, force bool) error {
-	localSHA, err := h.git.RevParse(src)
-	if err != nil {
-		return fmt.Errorf("cannot resolve %s: %w", src, err)
-	}
-
-	if existing, ok := h.refs[dst]; ok && existing.sha != localSHA && !force {
-		if !h.git.HasObject(existing.sha) {
-			return fmt.Errorf("remote is at %s which is not known locally; fetch first", existing.sha[:12])
-		}
-		ffwd, err := h.git.IsAncestor(existing.sha, localSHA)
-		if err != nil {
-			return err
-		}
-		if !ffwd {
-			return fmt.Errorf("non-fast-forward (remote is at %s); fetch first or force-push", existing.sha[:12])
-		}
-	}
-
-	// 1. Bundle the full history of the pushed commit. Deduplication
-	// against everything already stored happens inside kopia, so only the
-	// changed chunks are actually uploaded.
-	h.progressf("bundling %s (full history)", dst)
 	tmp, err := gitutil.TempFile("git-remote-s3vault-push-*.bundle")
 	if err != nil {
 		return err
 	}
-	tmpName := tmp.Name()
+	bundlePath := tmp.Name()
 	tmp.Close()
-	defer os.Remove(tmpName)
-	if err := h.git.BundleCreate(tmpName, localSHA); err != nil {
+	os.Remove(bundlePath) // bundle create wants to create it itself
+	defer os.Remove(bundlePath)
+
+	if len(newRefs) > 0 {
+		if err := h.buildSnapshotBundle(ctx, newRefs, bundlePath); err != nil {
+			return err
+		}
+	}
+
+	newState := &snapshot.State{Refs: newRefs, Head: head}
+	if len(newRefs) > 0 {
+		f, err := os.Open(bundlePath)
+		if err != nil {
+			return err
+		}
+		var size int64
+		if st, err := f.Stat(); err == nil {
+			size = st.Size()
+		}
+		if h.cfg.Encryption == config.EncryptionNone {
+			h.progressf("uploading snapshot (%s bundle, %d refs, deduplicated, PLAINTEXT)", humanSize(size), len(newRefs))
+		} else {
+			h.progressf("uploading snapshot (%s bundle, %d refs, deduplicated, encrypted)", humanSize(size), len(newRefs))
+		}
+		oid, err := h.krepo.WriteBundle(ctx, f)
+		f.Close()
+		if err != nil {
+			return err
+		}
+		newState.Bundle = oid
+		h.logf("snapshot bundle stored as kopia object %s", oid)
+	}
+
+	var recipient age.Recipient
+	if id := h.dekIdentity(); id != nil {
+		recipient = id.Recipient()
+	}
+	if err := snapshot.Save(ctx, h.store, h.cfg.Prefix, h.gen, newState, recipient, h.stateETag); err != nil {
+		if errors.Is(err, snapshot.ErrConcurrentUpdate) {
+			return fmt.Errorf("concurrent push detected: the remote changed since it was read; fetch and retry")
+		}
 		return err
 	}
 
-	// 2. Store bundle + ref (+ HEAD on the first branch) in one session.
-	if err := h.ensureRepo(ctx, true); err != nil {
-		return err
+	// Migration: a successful snapshot push supersedes v2 per-ref manifests.
+	if h.state == nil && len(h.refs) > 0 {
+		if err := h.krepo.DeleteV2Manifests(ctx); err != nil {
+			h.warnf("could not clean up pre-snapshot manifests: %v", err)
+		} else {
+			h.logf("migrated remote to the snapshot format")
+		}
 	}
-	f, err := os.Open(tmpName)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if h.cfg.Encryption == config.EncryptionNone {
-		h.progressf("uploading %s (%s bundle, deduplicated, PLAINTEXT)", dst, humanSize(st.Size()))
-	} else {
-		h.progressf("uploading %s (%s bundle, deduplicated, encrypted)", dst, humanSize(st.Size()))
-	}
-	setHead := h.headRef == "" && strings.HasPrefix(dst, "refs/heads/")
-	oid, err := h.krepo.PushRef(ctx, dst, localSHA, f, setHead)
-	if err != nil {
-		return err
-	}
-	h.logf("bundle stored as kopia object %s", oid)
 
-	if setHead {
-		h.headRef = dst
-	}
-	h.refs[dst] = remoteRef{sha: localSHA, object: oid}
+	h.state = newState
+	h.stateETag, _ = h.store.ETag(ctx, snapshot.Key(h.cfg.Prefix, h.gen))
+	h.unbundled = false
 	return nil
+}
+
+// buildSnapshotBundle produces one bundle containing the full history of
+// every ref in newRefs. Fast path: everything is in the local odb. Slow
+// path (refs exist remotely that this clone never fetched): merge the
+// remote's current objects with the pushed refs in a scratch bare repo,
+// mattn/git-remote-s3 style.
+func (h *Helper) buildSnapshotBundle(ctx context.Context, newRefs map[string]string, bundlePath string) error {
+	shas := make([]string, 0, len(newRefs))
+	haveAll := true
+	for _, sha := range newRefs {
+		shas = append(shas, sha)
+		if !h.git.HasObject(sha) {
+			haveAll = false
+		}
+	}
+	sort.Strings(shas)
+
+	if haveAll {
+		h.progressf("bundling snapshot (%d refs)", len(newRefs))
+		return h.git.BundleCreateRefs(bundlePath, shas)
+	}
+
+	h.progressf("merging remote refs absent from this clone (%d refs total)", len(newRefs))
+	scratchDir, err := os.MkdirTemp("", "git-remote-s3vault-scratch-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(scratchDir)
+	scratch, err := h.git.NewScratch(scratchDir)
+	if err != nil {
+		return err
+	}
+
+	// Seed the scratch repo with the remote's objects.
+	if h.state != nil && h.state.Bundle != "" {
+		path, cleanup, err := h.downloadBundleToTemp(ctx, h.state.Bundle, "current snapshot")
+		if err != nil {
+			return err
+		}
+		err = h.git.FetchBundle(scratch, path)
+		cleanup()
+		if err != nil {
+			return err
+		}
+	} else {
+		for name, rr := range h.refs {
+			if rr.object == "" {
+				continue
+			}
+			path, cleanup, err := h.downloadBundleToTemp(ctx, rr.object, name)
+			if err != nil {
+				return err
+			}
+			err = h.git.FetchBundle(scratch, path)
+			cleanup()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	// Normalize the scratch refs to exactly the new ref table (bundle
+	// headers carry temporary names, so seeded ref names are junk).
+	gitDir, err := h.git.GitDir()
+	if err != nil {
+		return err
+	}
+	for name, sha := range newRefs {
+		if h.git.HasObjectIn(scratch, sha) {
+			if err := h.git.UpdateRefIn(scratch, name, sha); err != nil {
+				return err
+			}
+		} else if err := h.git.FetchLocal(scratch, gitDir, sha, name); err != nil {
+			return err
+		}
+	}
+	existing, err := h.git.ListRefsIn(scratch)
+	if err != nil {
+		return err
+	}
+	for _, name := range existing {
+		if _, keep := newRefs[name]; !keep {
+			h.git.DeleteRefIn(scratch, name) //nolint:errcheck // cleanup
+		}
+	}
+	return h.git.BundleAll(scratch, bundlePath)
 }
 
 // maybeSuggestGC recommends `git gc` (once per session) when the local

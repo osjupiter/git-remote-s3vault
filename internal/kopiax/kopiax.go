@@ -299,6 +299,39 @@ func (r *Repo) Head(ctx context.Context) (string, error) {
 	return p.Target, nil
 }
 
+// WriteBundle stores a bundle as a plain kopia object (snapshot model:
+// refs live in the state record, not in kopia manifests) and returns its
+// object ID.
+func (r *Repo) WriteBundle(ctx context.Context, bundle io.Reader) (string, error) {
+	var oidStr string
+	err := repo.WriteSession(ctx, r.rep, repo.WriteSessionOptions{Purpose: "git-remote-s3vault snapshot"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			ow := w.NewObjectWriter(ctx, object.WriterOptions{Description: "git snapshot bundle"})
+			defer ow.Close() //nolint:errcheck // Result() surfaces errors
+			if _, err := io.Copy(ow, bundle); err != nil {
+				return fmt.Errorf("writing bundle: %w", err)
+			}
+			oid, err := ow.Result()
+			if err != nil {
+				return fmt.Errorf("finalizing bundle: %w", err)
+			}
+			oidStr = oid.String()
+			return nil
+		})
+	return oidStr, err
+}
+
+// DeleteV2Manifests removes the per-ref manifests of the pre-snapshot
+// format after a successful migration push.
+func (r *Repo) DeleteV2Manifests(ctx context.Context) error {
+	for _, labels := range []map[string]string{{"type": "gitref"}, {"type": "githead"}} {
+		if err := r.deleteManifests(ctx, labels); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // PushRef stores a bundle and points the ref at it, optionally also
 // setting HEAD, in one write session. It returns the bundle's object ID.
 func (r *Repo) PushRef(ctx context.Context, name, sha string, bundle io.Reader, setHead bool) (string, error) {
