@@ -132,9 +132,26 @@ credentials), cloning is just git:
 $ git clone s3ee://my-bucket/my-repo
 ```
 
-For a machine that has nothing yet, `git-remote-s3ee clone` prepares
-everything first — machine key, credentials, access check — and tells you
-exactly what's missing instead of failing with a cryptic decryption error:
+For a machine that has nothing yet, run `git-remote-s3ee clone` with no
+arguments and answer the wizard (same style as `setup` — endpoint,
+credentials, bucket, prefix, target directory):
+
+```console
+$ git-remote-s3ee clone
+Interactive clone — Enter accepts the [default].
+
+S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3): ...
+Access Key ID (empty to configure later): ...
+Secret Access Key:
+Bucket name: my-bucket
+Prefix inside the bucket: my-repo
+Clone into directory [my-repo]:
+Clone s3ee://my-bucket/my-repo into "my-repo"? [Y]:
+```
+
+It prepares everything a plain `git clone` would need — machine key,
+credentials, access check — and tells you exactly what's missing instead
+of failing with a cryptic decryption error:
 
 ```console
 $ git-remote-s3ee clone s3ee://my-bucket/my-repo

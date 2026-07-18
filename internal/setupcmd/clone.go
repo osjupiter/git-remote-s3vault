@@ -1,6 +1,7 @@
 package setupcmd
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -12,33 +13,51 @@ import (
 	"strings"
 
 	"github.com/osjupiter/git-remote-s3ee/internal/config"
+	"github.com/osjupiter/git-remote-s3ee/internal/credstore"
 	"github.com/osjupiter/git-remote-s3ee/internal/cryptox"
 	"github.com/osjupiter/git-remote-s3ee/internal/keyring"
 	"github.com/osjupiter/git-remote-s3ee/internal/storage"
 )
 
-// RunClone implements `git-remote-s3ee clone <url> [dir]`: the onboarding
-// path for a second machine or a teammate. It prepares everything a plain
-// `git clone` would need — machine key, credentials, access — with
-// actionable errors when a step is missing, then runs git clone and
-// persists the backend settings into the fresh repository.
-func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+// RunClone implements `git-remote-s3ee clone [url] [dir]`: the onboarding
+// path for a second machine or a teammate. With no URL an interactive
+// wizard (same style as setup) asks for the endpoint, credentials, bucket,
+// and target directory. It prepares everything a plain `git clone` would
+// need — machine key, credentials, access — with actionable errors when a
+// step is missing, then runs git clone and persists the backend settings
+// into the fresh repository.
+func RunClone(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("git-remote-s3ee clone", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	endpoint := fs.String("endpoint", "", "explicit S3 endpoint URL (MinIO, AWS, ...)")
 	identityPath := fs.String("identity", "", "machine key file (default: ~/.config/git-remote-s3ee/identity.txt, generated if missing)")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: git-remote-s3ee clone <s3ee://bucket/prefix> [directory] [flags]\n\n")
+		fmt.Fprintf(stderr, "usage: git-remote-s3ee clone [s3ee://bucket/prefix] [directory] [flags]\n")
+		fmt.Fprintf(stderr, "(with no URL, an interactive wizard asks for everything)\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 || fs.NArg() > 2 {
+	if fs.NArg() > 2 {
 		fs.Usage()
-		return fmt.Errorf("expected a remote URL and an optional target directory")
+		return fmt.Errorf("expected at most a remote URL and a target directory")
 	}
 	rawURL := fs.Arg(0)
+	dir := fs.Arg(1)
+	if rawURL == "" {
+		answers, err := runCloneWizard(stdin, stdout, *endpoint)
+		if err != nil {
+			return err
+		}
+		rawURL = answers.rawURL
+		if dir == "" {
+			dir = answers.dir
+		}
+		if answers.endpoint != "" {
+			*endpoint = answers.endpoint
+		}
+	}
 	if err := config.ValidateURL(rawURL); err != nil {
 		return err
 	}
@@ -106,7 +125,6 @@ func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 
 	// 4. The actual clone.
-	dir := fs.Arg(1)
 	if dir == "" {
 		dir = deriveCloneDir(rawURL)
 	}
@@ -137,6 +155,71 @@ func RunClone(ctx context.Context, args []string, stdout, stderr io.Writer) erro
 	}
 	fmt.Fprintf(stdout, "✓ cloned into %s\n", dir)
 	return nil
+}
+
+// cloneAnswers is what the interactive clone wizard collects.
+type cloneAnswers struct {
+	rawURL   string
+	endpoint string
+	dir      string
+}
+
+// runCloneWizard asks for everything a fresh machine needs to clone, in
+// the same style as the setup wizard. Entered credentials are saved after
+// the final confirmation.
+func runCloneWizard(stdin io.Reader, stdout io.Writer, endpointFlag string) (*cloneAnswers, error) {
+	in := bufio.NewReader(stdin)
+	ask := newAsk(in, stdout)
+
+	fmt.Fprintf(stdout, "Interactive clone — Enter accepts the [default].\n\n")
+	a := &cloneAnswers{endpoint: endpointFlag}
+
+	if a.endpoint == "" {
+		var err error
+		if a.endpoint, err = askEndpoint(ask); err != nil {
+			return nil, err
+		}
+	}
+	creds, err := askCredentials(ask, in, stdout)
+	if err != nil {
+		return nil, err
+	}
+
+	var bucket string
+	for bucket == "" {
+		if bucket, err = ask("Bucket name", ""); err != nil {
+			return nil, err
+		}
+	}
+	prefix, err := ask("Prefix inside the bucket", "")
+	if err != nil {
+		return nil, err
+	}
+	a.rawURL = "s3ee://" + bucket
+	if p := strings.Trim(prefix, "/"); p != "" {
+		a.rawURL += "/" + p
+	}
+	if a.dir, err = ask("Clone into directory", deriveCloneDir(a.rawURL)); err != nil {
+		return nil, err
+	}
+
+	confirm, err := ask(fmt.Sprintf("Clone %s into %q?", a.rawURL, a.dir), "Y")
+	if err != nil {
+		return nil, err
+	}
+	if s := strings.ToLower(confirm); s != "y" && s != "yes" {
+		return nil, fmt.Errorf("clone aborted; nothing was changed")
+	}
+
+	if creds != nil {
+		path, section, err := credstore.Save(a.endpoint, bucket, *creds)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(stdout, "✓ credentials saved to %s [%s]\n", path, section)
+	}
+	fmt.Fprintf(stdout, "\n")
+	return a, nil
 }
 
 // deriveCloneDir mimics git's target-directory derivation from a URL.

@@ -234,21 +234,7 @@ type wizardAnswers struct {
 // works.
 func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption string) (*wizardAnswers, error) {
 	in := bufio.NewReader(stdin)
-	ask := func(label, def string) (string, error) {
-		if def != "" {
-			fmt.Fprintf(stdout, "%s [%s]: ", label, def)
-		} else {
-			fmt.Fprintf(stdout, "%s: ", label)
-		}
-		line, err := in.ReadString('\n')
-		if err != nil && line == "" {
-			return "", fmt.Errorf("setup aborted (input closed)")
-		}
-		if v := sanitizeAnswer(line); v != "" {
-			return v, nil
-		}
-		return def, nil
-	}
+	ask := newAsk(in, stdout)
 
 	fmt.Fprintf(stdout, "Interactive setup — Enter accepts the [default].\n\n")
 	a := &wizardAnswers{}
@@ -273,38 +259,16 @@ func runWizard(stdin io.Reader, stdout io.Writer, defaultRemote, encryption stri
 		}
 	}
 
-	// Any S3-compatible endpoint: R2 is https://<account>.r2.cloudflarestorage.com,
-	// MinIO is your server, empty means AWS S3.
-	{
-		def := firstNonEmptyEnv("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
-		var err error
-		if a.endpoint, err = ask("S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3)", def); err != nil {
-			return nil, err
-		}
+	var err error
+	if a.endpoint, err = askEndpoint(ask); err != nil {
+		return nil, err
 	}
 
 	// Credentials come right after the backend, before the bucket, so all
 	// connection settings are entered in one block.
-	var creds *credstore.Credentials
-	if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
-		fmt.Fprintf(stdout, "✓ using credentials from the environment\n")
-	} else {
-		fmt.Fprintf(stdout, "Credentials — tip: use an API token scoped to ONLY the target bucket\n")
-		fmt.Fprintf(stdout, "(Object Read & Write), so a leaked key cannot touch anything else.\n")
-		keyID, err := ask("Access Key ID (empty to configure later)", "")
-		if err != nil {
-			return nil, err
-		}
-		if keyID != "" {
-			secret, err := askSecret(in, stdout, "Secret Access Key")
-			if err != nil {
-				return nil, err
-			}
-			if secret == "" {
-				return nil, fmt.Errorf("empty secret access key")
-			}
-			creds = &credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret}
-		}
+	creds, err := askCredentials(ask, in, stdout)
+	if err != nil {
+		return nil, err
 	}
 
 	var bucket string
@@ -382,6 +346,58 @@ func askSecret(in *bufio.Reader, stdout io.Writer, label string) (string, error)
 		return "", fmt.Errorf("setup aborted (input closed)")
 	}
 	return sanitizeAnswer(line), nil
+}
+
+// newAsk builds the wizard prompt function: prints "label [default]: ",
+// reads one sanitized line, and falls back to the default on empty input.
+func newAsk(in *bufio.Reader, stdout io.Writer) func(label, def string) (string, error) {
+	return func(label, def string) (string, error) {
+		if def != "" {
+			fmt.Fprintf(stdout, "%s [%s]: ", label, def)
+		} else {
+			fmt.Fprintf(stdout, "%s: ", label)
+		}
+		line, err := in.ReadString('\n')
+		if err != nil && line == "" {
+			return "", fmt.Errorf("aborted (input closed)")
+		}
+		if v := sanitizeAnswer(line); v != "" {
+			return v, nil
+		}
+		return def, nil
+	}
+}
+
+// askEndpoint asks for the S3 endpoint with env-derived defaults.
+func askEndpoint(ask func(string, string) (string, error)) (string, error) {
+	def := firstNonEmptyEnv("GIT_REMOTE_S3EE_ENDPOINT", "AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+	return ask("S3 endpoint URL (R2: https://<account>.r2.cloudflarestorage.com, empty: AWS S3)", def)
+}
+
+// askCredentials collects an access key pair unless the environment
+// already provides one. Returns nil when skipped.
+func askCredentials(ask func(string, string) (string, error), in *bufio.Reader, stdout io.Writer) (*credstore.Credentials, error) {
+	if os.Getenv("AWS_ACCESS_KEY_ID") != "" && os.Getenv("AWS_SECRET_ACCESS_KEY") != "" {
+		fmt.Fprintf(stdout, "✓ using credentials from the environment\n")
+		return nil, nil
+	}
+	fmt.Fprintf(stdout, "Credentials — tip: use an API token scoped to ONLY the target bucket\n")
+	fmt.Fprintf(stdout, "(Object Read & Write), so a leaked key cannot touch anything else.\n")
+	keyID, err := ask("Access Key ID (empty to configure later)", "")
+	if err != nil {
+		return nil, err
+	}
+	if keyID == "" {
+		return nil, nil
+	}
+	secret, err := askSecret(in, stdout, "Secret Access Key")
+	if err != nil {
+		return nil, err
+	}
+	if secret == "" {
+		return nil, fmt.Errorf("empty secret access key")
+	}
+	return &credstore.Credentials{AccessKeyID: keyID, SecretAccessKey: secret}, nil
 }
 
 // sanitizeAnswer strips bracketed-paste markers and control characters

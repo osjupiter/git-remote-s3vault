@@ -786,6 +786,21 @@ func TestCloneCommandFlow(t *testing.T) {
 	if ep, err := cmd.Output(); err != nil || strings.TrimSpace(string(ep)) != h.endpoint {
 		t.Errorf("endpoint not persisted in clone: %q, %v", ep, err)
 	}
+
+	// The interactive wizard path: `clone` with no arguments, answers over
+	// stdin (endpoint default from env, credentials from env, bucket,
+	// prefix, directory, confirm).
+	wiz := exec.Command(bin, "clone")
+	wiz.Dir = work
+	wiz.Env = append(append([]string{}, h.baseEnv...), bobEnv...)
+	wiz.Stdin = strings.NewReader("\n" + bucket + "\nclone-cmd\nwizclone\n\n")
+	out, err = func() (string, error) { b, e := wiz.CombinedOutput(); return string(b), e }()
+	if err != nil {
+		t.Fatalf("wizard clone: %v\n%s", err, out)
+	}
+	if data, err := os.ReadFile(filepath.Join(work, "wizclone", "hello.txt")); err != nil || string(data) != "clone me\n" {
+		t.Fatalf("wizard-cloned content: %q, %v", data, err)
+	}
 }
 
 func firstLine(s string) string {

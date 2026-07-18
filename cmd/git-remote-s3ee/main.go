@@ -45,7 +45,7 @@ func main() {
 		return
 	}
 	if len(os.Args) >= 2 && os.Args[1] == "clone" && os.Getenv("GIT_DIR") == "" {
-		if err := setupcmd.RunClone(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil {
+		if err := setupcmd.RunClone(ctx, os.Args[2:], os.Stdin, os.Stdout, os.Stderr); err != nil {
 			fatal(err)
 		}
 		return

@@ -379,16 +379,47 @@ func TestCloneRejectsBadInput(t *testing.T) {
 	setupRepo(t) // isolates env; clone itself runs anywhere
 	runClone := func(args ...string) error {
 		var out bytes.Buffer
-		return RunClone(context.Background(), args, &out, &out)
+		return RunClone(context.Background(), args, strings.NewReader(""), &out, &out)
 	}
 	if err := runClone(); err == nil {
-		t.Error("clone without a URL must fail")
+		t.Error("clone without a URL and no wizard input must fail")
 	}
 	if err := runClone("https://github.com/x/y.git"); err == nil {
 		t.Error("clone with a non-r2 URL must fail")
 	}
 	if err := runClone("s3ee://b/p", "dir", "extra"); err == nil {
 		t.Error("clone with too many args must fail")
+	}
+}
+
+func TestCloneWizardCollectsAnswers(t *testing.T) {
+	setupRepo(t) // env isolation
+	var out bytes.Buffer
+	// endpoint, access key, secret, bucket, prefix, dir (default), confirm.
+	a, err := runCloneWizard(strings.NewReader(
+		"https://ep.example.com\nAKIA9\nsss\nbkt\nteam/proj\n\n\n"), &out, "")
+	if err != nil {
+		t.Fatalf("wizard: %v\n%s", err, out.String())
+	}
+	if a.rawURL != "s3ee://bkt/team/proj" || a.endpoint != "https://ep.example.com" || a.dir != "proj" {
+		t.Errorf("answers = %+v", a)
+	}
+	// Credentials were saved for the bucket after the confirmation.
+	if c, ok := credstore.Lookup("https://ep.example.com", "bkt"); !ok || c.AccessKeyID != "AKIA9" {
+		t.Errorf("credentials not saved: %+v %v", c, ok)
+	}
+}
+
+func TestCloneWizardAbortSavesNothing(t *testing.T) {
+	setupRepo(t)
+	var out bytes.Buffer
+	_, err := runCloneWizard(strings.NewReader(
+		"https://ep.example.com\nAKIA9\nsss\nbkt\n\n\nn\n"), &out, "")
+	if err == nil {
+		t.Fatal("declined confirmation must abort")
+	}
+	if _, ok := credstore.Lookup("https://ep.example.com", "bkt"); ok {
+		t.Fatal("aborted wizard must not save credentials")
 	}
 }
 
